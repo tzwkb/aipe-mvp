@@ -1,0 +1,27 @@
+# secrets
+.env
+*.key
+
+# client data / corpus / vector snapshots (confidential + large — never in git)
+*.snapshot
+*.xlsx
+*.jsonl
+*.docx
+corpus/
+cleaned_corpus/
+run/
+aipe/data/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/

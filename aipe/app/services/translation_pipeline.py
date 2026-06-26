@@ -1,0 +1,1135 @@
+"""翻译 Pipeline 编排：术语命中 → RAG → Prompt → LLM → 输出。
+
+术语命中结果与 RAG 检索结果一同作为 Prompt 的参考段，由 LLM 结合语境决定是否采用，
+避免占位符强替换带来的"硬翻译"。
+
+提供两条调用路径：
+- ``translate_single``：单句无状态端到端翻译（默认路径）
+- ``translate_group``：整组并排翻译（结构高度相似的句子用同一英文句式，保证一致性）
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+
+from app.errors import TranslationError
+from app.schemas.rag import RAGSearchResult
+from app.schemas.terminology import TermEntry
+from app.schemas.translate import TranslationResult
+from app.schemas.web_search import WebSearchResult
+from app.services.llm_service import LLMService
+from app.services.rag_service import RAGDiagnostics, RAGService
+from app.services.style_guide_service import ContentType, StyleGuideService
+from app.services.terminology_service import TerminologyService
+from app.services.vision_service import VisionService
+from app.services.web_search_service import WebSearchService
+from app.utils.cluster import common_template_repr
+
+logger = logging.getLogger(__name__)
+
+
+_BASE_SYSTEM = (
+    "你是一名专业的游戏本地化译者，负责将中文游戏文本翻译为英文。\n"
+    "请遵守以下要求：\n\n"
+    "## 翻译要求\n"
+    "1. 术语参考段是高优先级提示，默认应使用其中给出的目标译文，但是可以根据具体情况调整使用合适的字母大小写；仅在语境明显冲突或会导致句子不通顺时才允许调整\n"
+    "2. RAG 参考例句反映游戏内同类语境的真实译法，请结合相似度分数与上下文综合参考\n"
+    "3. 保持武侠 / 江湖 / 古风调性，避免现代口语\n"
+    "4. 按照下方输出格式要求输出，不要输出格式外的额外内容\n"
+    "5. 外部网络参考段（如有）来自公开网络搜索，优先级最低；只用来理解专有名词的背景，与术语 / RAG 冲突时一律以术语 / RAG 为准\n\n"
+    "## 富文本与变量标记规则\n"
+    "待翻译文本中可能出现以下特殊标记，请按规则处理，确保输出中标记位置正确：\n\n"
+    "1. **字体格式标签**（非打印字符）：`#G......#E`、`#C......#E`、`#Y......#E` 等用于定义二者之间的文字格式（如颜色）。\n"
+    "   译文需要保留这些标签，并将对应的英文译文放在标签之间（即 `#G` 与 `#E` 之间）。\n\n"
+    "2. **通用文本变量**（打印字符）：`{}` 为空占位符，翻译时将其视为实际文本内容的一部分处理，确保位置正确。\n\n"
+    "3. **具名文本变量**（打印字符）：如 `{slot1_qishu_name}`、`{kungfu_main_name}` 等。\n"
+    "   这些是真实文本的占位符，译文需考虑其实际含义，将其放在语法和语义都恰当的位置。\n\n"
+    "4. **数值标量**（打印字符）：如 `{standard_value}`、`{qishu_standard_value}` 等。\n"
+    "   这些是实际数值的占位符，译文需根据语境判断其在句子中的合理位置并正确放置。\n"
+    "5. <x id=\"64\"/> 这样的没有实际意义的原文标签应该完全保留\n"
+)
+
+
+# 整组翻译输出解析正则：兼容 `1.` `1)` `1：` `1、` 等多种序号写法
+_NUMBERED_LINE_RE = re.compile(r"^\s*(\d+)\s*[.\)）。、:：]\s*(.+?)\s*$")
+
+
+_WEB_SECTION_HEADER = (
+    "## 外部网络参考（可能不准 — 仅作背景理解，不要直接照抄措辞）\n"
+    "以下内容来自公开网络搜索，可能含错误、口语化译法或与本游戏无关的同名条目。\n"
+    "请把它当作\"了解专有名词的语境\"用，绝不能凌驾于术语参考和 RAG 参考之上。"
+)
+
+
+class TranslationPipeline:
+    """翻译流水线。``translate_single`` / ``translate_group`` 都是无状态端到端调用。"""
+
+    def __init__(
+        self,
+        terminology_svc: TerminologyService,
+        rag_svc: RAGService,
+        style_guide_svc: StyleGuideService,
+        llm_svc: LLMService,
+        web_search_svc: WebSearchService | None = None,
+        web_search_dense_threshold: float = 0.6,
+        vision_svc: VisionService | None = None,
+    ):
+        self.terminology_svc = terminology_svc
+        self.rag_svc = rag_svc
+        self.style_guide_svc = style_guide_svc
+        self.llm_svc = llm_svc
+        # 可选注入：未传或 disabled 时所有 Web 搜索逻辑短路跳过
+        self.web_search_svc = web_search_svc
+        self.default_web_search_dense_threshold = web_search_dense_threshold
+        self.vision_svc = vision_svc
+
+    # ---------- 单句路径 ----------
+
+    async def translate_single(
+        self,
+        text: str,
+        *,
+        enable_rag: bool = True,
+        rag_threshold: float | None = None,
+        rag_top_k: int | None = None,
+        content_type: ContentType | None = None,
+        rag_collection: str | None = None,
+        enable_web_search: bool = False,
+        web_search_dense_threshold: float | None = None,
+        enable_vision: bool = True,
+    ) -> TranslationResult:
+        """端到端翻译一句。失败时返回 status=error，不抛异常（保证批量不被单句拖垮）。
+
+        ``content_type`` 传入非空时直接复用，跳过 LLM 预分类。
+
+        ``enable_web_search=True`` 且术语 0 命中 + RAG 弱召回时，调用 Web 搜索补充背景。
+        """
+        source = (text or "").strip()
+        if not source:
+            return TranslationResult(
+                source=text or "",
+                translation="",
+                status="error",
+                error_msg="empty input",
+            )
+
+        # Step 0: 文本类型分类（传入时跳过，否则 LLM 预分类）
+        if content_type is None:
+            content_type = await self._classify_text(source)
+            logger.debug("文本分类: %r… → %s", source[:30], content_type.value)
+        else:
+            logger.debug("文本分类(复用传入): %r… → %s", source[:30], content_type.value)
+
+        # Step 1: 术语命中匹配（仅作为 Prompt 参考段，不修改原文）
+        term_matches = self.terminology_svc.find_matches(source)
+
+        # Step 2: RAG 检索（异常降级为空参考）
+        references: list[RAGSearchResult] = []
+        diag: RAGDiagnostics = RAGDiagnostics(dense_top1=None, sparse_hits=0)
+        if enable_rag:
+            try:
+                if self._web_search_active(enable_web_search):
+                    references, diag = await self.rag_svc.search_with_diagnostics(
+                        source,
+                        threshold=rag_threshold,
+                        top_k=rag_top_k,
+                        collection=rag_collection,
+                    )
+                else:
+                    references = await self.rag_svc.search(
+                        source,
+                        threshold=rag_threshold,
+                        top_k=rag_top_k,
+                        collection=rag_collection,
+                    )
+            except Exception as exc:
+                logger.warning("RAG 检索失败，跳过参考: %s", exc)
+                references = []
+                diag = RAGDiagnostics(dense_top1=None, sparse_hits=0)
+
+        # Step 2.5: Web 搜索兜底（仅在术语 0 命中 + RAG 弱召回 + 用户启用时触发）
+        web_refs, web_triggered = await self._maybe_web_search(
+            source,
+            term_matches=term_matches,
+            diag=diag,
+            enable_web_search=enable_web_search,
+            user_threshold=web_search_dense_threshold,
+            enable_vision=enable_vision,
+        )
+
+        # Step 3: Prompt 组装
+        messages = self._build_messages(
+            source, term_matches, references, content_type, web_refs=web_refs
+        )
+
+        image_analysis = _extract_image_analysis(web_refs)
+
+        # Step 4: LLM 翻译
+        try:
+            raw = await self.llm_svc.translate(messages)
+            translation, translation_reason = _parse_single_llm_output(raw)
+        except TranslationError as exc:
+            return TranslationResult(
+                source=source,
+                translation=f"[ERROR: AI_FAIL] {source}",
+                status="error",
+                content_type=content_type.value,
+                terminology_used=self._term_used_view(term_matches),
+                rag_references=self._refs_view(references),
+                web_references=self._web_view(web_refs),
+                web_search_triggered=web_triggered if enable_web_search else None,
+                image_analysis=image_analysis,
+                error_msg=str(exc),
+            )
+
+        # Step 5: 输出
+        return TranslationResult(
+            source=source,
+            translation=translation,
+            translation_reason=translation_reason,
+            status="success",
+            content_type=content_type.value,
+            terminology_used=self._term_used_view(term_matches),
+            rag_references=self._refs_view(references),
+            web_references=self._web_view(web_refs),
+            web_search_triggered=web_triggered if enable_web_search else None,
+            image_analysis=image_analysis,
+        )
+
+    # ---------- 整组路径 ----------
+
+    async def translate_group(
+        self,
+        sources: list[str],
+        *,
+        enable_rag: bool = True,
+        rag_threshold: float | None = None,
+        rag_top_k: int | None = None,
+        content_type: ContentType | None = None,
+        rag_collection: str | None = None,
+        enable_web_search: bool = False,
+        web_search_dense_threshold: float | None = None,
+        enable_vision: bool = True,
+    ) -> list[TranslationResult]:
+        """整组并排翻译。所有句子共享结构模板，要求 LLM 用同一英文句式。
+
+        输入 N 句、输出 N 句，顺序与输入对齐。失败（LLM 报错 / 解析失败）时
+        自动 fallback 为逐句 ``translate_single``，确保对外语义与单句路径一致。
+
+        ``content_type`` 传入非空时直接复用，跳过 LLM 预分类。
+
+        ``enable_web_search=True`` 时只对**代表句**（template_repr 或首句）发一次 Web
+        搜索，结果整组共享。
+        """
+        if not sources:
+            return []
+        if len(sources) == 1:
+            return [
+                await self.translate_single(
+                    sources[0],
+                    enable_rag=enable_rag,
+                    rag_threshold=rag_threshold,
+                    rag_top_k=rag_top_k,
+                    content_type=content_type,
+                    rag_collection=rag_collection,
+                    enable_web_search=enable_web_search,
+                    web_search_dense_threshold=web_search_dense_threshold,
+                    enable_vision=enable_vision,
+                )
+            ]
+
+        cleaned = [(s or "").strip() for s in sources]
+        if not all(cleaned):
+            # 出现空串时回退单句（translate_single 会对空串返回 error 结果）
+            return await self._fallback_singles(
+                sources,
+                enable_rag=enable_rag,
+                rag_threshold=rag_threshold,
+                rag_top_k=rag_top_k,
+                content_type=content_type,
+                rag_collection=rag_collection,
+                enable_web_search=enable_web_search,
+                web_search_dense_threshold=web_search_dense_threshold,
+                enable_vision=enable_vision,
+            )
+
+        # Step 0: 分类（传入时跳过，否则对代表句预分类）
+        if content_type is None:
+            content_type = await self._classify_text(cleaned[0])
+            logger.debug(
+                "整组分类: size=%d 代表句=%r → %s",
+                len(cleaned),
+                cleaned[0][:30],
+                content_type.value,
+            )
+        else:
+            logger.debug(
+                "整组分类(复用传入): size=%d 代表句=%r → %s",
+                len(cleaned),
+                cleaned[0][:30],
+                content_type.value,
+            )
+
+        # Step 1: 术语命中（对每句独立扫描后并集去重，保持出现顺序）
+        term_matches = self._collect_terms(cleaned)
+
+        # Step 2: RAG（每句并行检索，按 score 合并去重）
+        references: list[RAGSearchResult] = []
+        if enable_rag:
+            references = await self._collect_references(
+                cleaned, threshold=rag_threshold, top_k=rag_top_k, collection=rag_collection
+            )
+
+        # Step 2.5: 整组 Web 搜索兜底（只用代表句触发，整组共享一次结果）
+        template_hint = common_template_repr(cleaned)
+        web_refs, web_triggered = await self._group_web_search(
+            cleaned,
+            template_hint=template_hint,
+            term_matches=term_matches,
+            enable_rag=enable_rag,
+            rag_threshold=rag_threshold,
+            rag_collection=rag_collection,
+            enable_web_search=enable_web_search,
+            user_threshold=web_search_dense_threshold,
+            enable_vision=enable_vision,
+        )
+
+        # Step 3: 构建整组 prompt
+        messages = self._build_group_messages(
+            cleaned, term_matches, references, content_type, template_hint, web_refs=web_refs
+        )
+
+        # Step 4: LLM 调用
+        try:
+            raw = await self.llm_svc.translate(messages)
+        except TranslationError as exc:
+            logger.warning("整组翻译 LLM 失败，回退单句: %s", exc)
+            return await self._fallback_singles(
+                sources,
+                enable_rag=enable_rag,
+                rag_threshold=rag_threshold,
+                rag_top_k=rag_top_k,
+                rag_collection=rag_collection,
+                enable_web_search=enable_web_search,
+                web_search_dense_threshold=web_search_dense_threshold,
+                enable_vision=enable_vision,
+            )
+
+        # Step 5: 解析编号输出
+        parsed = _parse_numbered_output(raw, expected=len(cleaned))
+        if parsed is None:
+            logger.warning(
+                "整组翻译输出解析失败（期望 %d 行），回退单句。原始输出前 200 字: %r",
+                len(cleaned),
+                raw[:200],
+            )
+            return await self._fallback_singles(
+                sources,
+                enable_rag=enable_rag,
+                rag_threshold=rag_threshold,
+                rag_top_k=rag_top_k,
+                rag_collection=rag_collection,
+                enable_web_search=enable_web_search,
+                web_search_dense_threshold=web_search_dense_threshold,
+                enable_vision=enable_vision,
+            )
+
+        term_view = self._term_used_view(term_matches)
+        refs_view = self._refs_view(references)
+        web_view = self._web_view(web_refs)
+        web_triggered_view = web_triggered if enable_web_search else None
+        image_analysis = _extract_image_analysis(web_refs)
+        return [
+            TranslationResult(
+                source=src,
+                translation=tr,
+                translation_reason=reason,
+                status="success",
+                content_type=content_type.value,
+                terminology_used=term_view,
+                rag_references=refs_view,
+                web_references=web_view,
+                web_search_triggered=web_triggered_view,
+                image_analysis=image_analysis,
+            )
+            for src, (tr, reason) in zip(cleaned, parsed)
+        ]
+
+    # ---------- 对话路径 ----------
+
+    async def translate_dialog(
+        self,
+        sources: list[str],
+        speakers: list[str | None],
+        *,
+        dialog_id: str | None = None,
+        times: list[float | None] | None = None,
+        enable_rag: bool = True,
+        rag_threshold: float | None = None,
+        rag_top_k: int | None = None,
+        content_type: ContentType | None = None,
+        rag_collection: str | None = None,
+        enable_web_search: bool = False,
+        web_search_dense_threshold: float | None = None,
+        enable_vision: bool = True,
+    ) -> list[TranslationResult]:
+        """整段对话翻译。``sources`` 已按对话发生顺序排列，``speakers`` 与之等长。
+
+        失败策略与 ``translate_group`` 不同：LLM 报错或输出对齐解析失败时，整段
+        对话所有句子统一返回 ``status=error``，等待人工检查，**不回退单句**——因为
+        丢失上下文的单句译文质量反而更差。
+
+        ``len(sources) == 1`` 时直接走 ``translate_single`` 路径。
+        """
+        if not sources:
+            return []
+        if len(speakers) != len(sources):
+            raise ValueError(
+                f"speakers 长度({len(speakers)}) 与 sources 长度({len(sources)}) 不一致"
+            )
+        if times is not None and len(times) != len(sources):
+            raise ValueError(
+                f"times 长度({len(times)}) 与 sources 长度({len(sources)}) 不一致"
+            )
+
+        if len(sources) == 1:
+            return [
+                await self.translate_single(
+                    sources[0],
+                    enable_rag=enable_rag,
+                    rag_threshold=rag_threshold,
+                    rag_top_k=rag_top_k,
+                    content_type=content_type,
+                    rag_collection=rag_collection,
+                    enable_web_search=enable_web_search,
+                    web_search_dense_threshold=web_search_dense_threshold,
+                    enable_vision=enable_vision,
+                )
+            ]
+
+        cleaned = [(s or "").strip() for s in sources]
+        if not all(cleaned):
+            # 出现空句时退化为单句路径，translate_single 会对空串返回 error
+            return await self._fallback_singles(
+                sources,
+                enable_rag=enable_rag,
+                rag_threshold=rag_threshold,
+                rag_top_k=rag_top_k,
+                content_type=content_type,
+                rag_collection=rag_collection,
+                enable_web_search=enable_web_search,
+                web_search_dense_threshold=web_search_dense_threshold,
+                enable_vision=enable_vision,
+            )
+
+        # Step 0: 分类（传入时跳过；否则对代表句预分类）
+        if content_type is None:
+            content_type = await self._classify_text(cleaned[0])
+
+        # Step 1: 术语命中并集
+        term_matches = self._collect_terms(cleaned)
+
+        # Step 2: RAG
+        references: list[RAGSearchResult] = []
+        if enable_rag:
+            references = await self._collect_references(
+                cleaned, threshold=rag_threshold, top_k=rag_top_k, collection=rag_collection
+            )
+
+        # Step 2.5: 对话 Web 搜索兜底（用首句作代表句，整段共享）
+        web_refs, web_triggered = await self._group_web_search(
+            cleaned,
+            template_hint="",
+            term_matches=term_matches,
+            enable_rag=enable_rag,
+            rag_threshold=rag_threshold,
+            rag_collection=rag_collection,
+            enable_web_search=enable_web_search,
+            user_threshold=web_search_dense_threshold,
+            enable_vision=enable_vision,
+        )
+
+        # Step 3: 对话 prompt（times 仅用于排序，不进 prompt）
+        messages = self._build_dialog_messages(
+            cleaned, speakers, term_matches, references, content_type, dialog_id,
+            web_refs=web_refs,
+        )
+
+        term_view = self._term_used_view(term_matches)
+        refs_view = self._refs_view(references)
+        web_view = self._web_view(web_refs)
+        web_triggered_view = web_triggered if enable_web_search else None
+        image_analysis = _extract_image_analysis(web_refs)
+
+        # Step 4: LLM
+        try:
+            raw = await self.llm_svc.translate(messages)
+        except TranslationError as exc:
+            logger.warning(
+                "对话翻译 LLM 失败 dialog_id=%s n=%d: %s", dialog_id, len(cleaned), exc
+            )
+            return self._dialog_error_results(
+                cleaned,
+                content_type,
+                term_view,
+                refs_view,
+                reason="DIALOG_LLM_FAIL",
+                error_msg=str(exc),
+                web_view=web_view,
+                web_triggered=web_triggered_view,
+                image_analysis=image_analysis,
+            )
+
+        # Step 5: 解析编号输出
+        # 对话路径不强求编号为 {1..N}：LLM 可能保留 time 风格的数字（如游戏内部的
+        # 时间码）。只要求 N 行编号、按顺序映射到 N 个原文位置即可。
+        parsed = _parse_numbered_output_positional(raw, expected=len(cleaned))
+        if parsed is None:
+            logger.warning(
+                "对话翻译输出解析失败 dialog_id=%s 期望 %d 行，原始输出前 200 字: %r",
+                dialog_id,
+                len(cleaned),
+                raw[:200],
+            )
+            return self._dialog_error_results(
+                cleaned,
+                content_type,
+                term_view,
+                refs_view,
+                reason="DIALOG_PARSE_FAIL",
+                error_msg=f"对话整段输出解析失败（期望 {len(cleaned)} 行）",
+                web_view=web_view,
+                web_triggered=web_triggered_view,
+                image_analysis=image_analysis,
+            )
+
+        return [
+            TranslationResult(
+                source=src,
+                translation=tr,
+                translation_reason=reason,
+                status="success",
+                content_type=content_type.value,
+                terminology_used=term_view,
+                rag_references=refs_view,
+                web_references=web_view,
+                web_search_triggered=web_triggered_view,
+                image_analysis=image_analysis,
+            )
+            for src, (tr, reason) in zip(cleaned, parsed)
+        ]
+
+    @staticmethod
+    def _dialog_error_results(
+        cleaned: list[str],
+        content_type: ContentType,
+        term_view: list[dict],
+        refs_view: list[dict] | None,
+        *,
+        reason: str,
+        error_msg: str,
+        web_view: list[dict] | None = None,
+        web_triggered: bool | None = None,
+        image_analysis: str | None = None,
+    ) -> list[TranslationResult]:
+        return [
+            TranslationResult(
+                source=src,
+                translation=f"[ERROR: {reason}] {src}",
+                status="error",
+                content_type=content_type.value,
+                terminology_used=term_view,
+                rag_references=refs_view,
+                web_references=web_view,
+                web_search_triggered=web_triggered,
+                image_analysis=image_analysis,
+                error_msg=error_msg,
+            )
+            for src in cleaned
+        ]
+
+    def _build_dialog_messages(
+        self,
+        sources: list[str],
+        speakers: list[str | None],
+        term_matches: list[TermEntry],
+        references: list[RAGSearchResult],
+        content_type: ContentType,
+        dialog_id: str | None,
+        *,
+        web_refs: list[WebSearchResult] | None = None,
+    ) -> list[dict[str, str]]:
+        system = self.style_guide_svc.build_system_prompt_for_type(_BASE_SYSTEM, content_type)
+
+        header_bits = [f"以下是一段游戏内连续对话，共 {len(sources)} 句，按对话发生顺序列出。"]
+        if dialog_id:
+            header_bits.append(f"对话编号：{dialog_id}。")
+        header_bits.extend(
+            [
+                "请结合上下文（说话人身份、上下句衔接、语气、信息流向）翻译每一句，",
+                "确保整段译文在英文中读起来像一段连贯、自然的对话。",
+                "说话人姓名仅供你理解语境使用，**不要**在译文里输出说话人名字，",
+                "也无需保持说话人英文名跨条一致。",
+            ]
+        )
+
+        parts: list[str] = ["## 对话翻译任务", "\n".join(header_bits)]
+
+        if term_matches:
+            parts.append(
+                "## 术语参考（强烈推荐使用以下目标译文，除非语境明显冲突）"
+            )
+            parts.append(_format_term_section(term_matches))
+
+        if references:
+            parts.append(
+                "## 参考翻译（从游戏语料库 RAG 检索到的相似句子，含相似度分数）"
+            )
+            parts.append(_format_refs_section(references))
+
+        if web_refs:
+            parts.append(_WEB_SECTION_HEADER)
+            parts.append(_format_web_section(web_refs))
+
+        parts.append("## 对话内容")
+        parts.append(_format_dialog_lines(sources, speakers))
+
+        parts.append(
+            "## 输出格式（严格遵守）\n"
+            '逐行输出，每行格式为 `序号. {"translation": "英文译文", "reason": "简述理由（中文，1句话）"}`，'
+            "序号与对话编号严格对应，"
+            f"共 {len(sources)} 行。不要重复输出说话人姓名，不要输出原文，"
+            "不要加任何解释、标题或 Markdown。"
+        )
+
+        user = "\n\n".join(parts)
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    # ---------- helpers ----------
+
+    async def _classify_text(self, source: str, hint: str | None = None) -> ContentType:
+        """对文本进行类型分类；失败时静默降级为 UNKNOWN。
+
+        ``hint`` 传入时先尝试直接匹配为 ContentType，匹配成功则跳过 LLM 调用。
+        """
+        if hint:
+            # 精确匹配
+            for ct in ContentType:
+                if ct.value == hint:
+                    return ct
+            # 宽松匹配（用户可能用了别名或大小写不一致）
+            hint_norm = hint.strip()
+            for ct in ContentType:
+                if ct != ContentType.UNKNOWN and ct.value in hint_norm:
+                    return ct
+
+        if not self.style_guide_svc.loaded:
+            return ContentType.UNKNOWN
+        messages = self.style_guide_svc.build_classification_messages(source)
+        raw = await self.llm_svc.classify(messages)
+        if raw in {ct.value for ct in ContentType}:
+            return ContentType(raw)
+        # 宽松匹配：LLM 可能输出含有类型名的短语
+        for ct in ContentType:
+            if ct != ContentType.UNKNOWN and ct.value in raw:
+                return ct
+        logger.debug("分类结果 %r 不匹配已知类型，退化为 UNKNOWN", raw)
+        return ContentType.UNKNOWN
+
+    def _collect_terms(self, sources: list[str]) -> list[TermEntry]:
+        """对一组句子取术语命中并集，按首次出现顺序去重。"""
+        seen: set[str] = set()
+        out: list[TermEntry] = []
+        for s in sources:
+            for entry in self.terminology_svc.find_matches(s):
+                if entry.source in seen:
+                    continue
+                seen.add(entry.source)
+                out.append(entry)
+        return out
+
+    async def _collect_references(
+        self,
+        sources: list[str],
+        *,
+        threshold: float | None,
+        top_k: int | None,
+        collection: str | None = None,
+    ) -> list[RAGSearchResult]:
+        """对一组句子并行做 RAG 检索，按 (source,target) 去重并按 score 降序保留。
+
+        单句检索异常不会拖垮整组，错误会被吞掉记日志。
+        """
+        try:
+            results = await asyncio.gather(
+                *(
+                    self.rag_svc.search(s, threshold=threshold, top_k=top_k, collection=collection)
+                    for s in sources
+                ),
+                return_exceptions=True,
+            )
+        except Exception as exc:
+            logger.warning("整组 RAG 检索整体失败: %s", exc)
+            return []
+
+        seen: dict[tuple[str, str], RAGSearchResult] = {}
+        for r in results:
+            if isinstance(r, Exception):
+                logger.debug("整组 RAG 单句失败已忽略: %s", r)
+                continue
+            for ref in r:
+                key = (ref.source, ref.target)
+                prev = seen.get(key)
+                if prev is None or ref.score > prev.score:
+                    seen[key] = ref
+
+        merged = sorted(seen.values(), key=lambda r: r.score, reverse=True)
+        per_query_k = top_k if top_k is not None else self.rag_svc.top_k
+        cap = max(per_query_k, per_query_k * 2)
+        return merged[:cap]
+
+    async def _fallback_singles(
+        self,
+        sources: list[str],
+        *,
+        enable_rag: bool,
+        rag_threshold: float | None,
+        rag_top_k: int | None,
+        content_type: ContentType | None = None,
+        rag_collection: str | None = None,
+        enable_web_search: bool = False,
+        web_search_dense_threshold: float | None = None,
+        enable_vision: bool = True,
+    ) -> list[TranslationResult]:
+        out: list[TranslationResult] = []
+        for src in sources:
+            out.append(
+                await self.translate_single(
+                    src,
+                    enable_rag=enable_rag,
+                    rag_threshold=rag_threshold,
+                    rag_top_k=rag_top_k,
+                    content_type=content_type,
+                    rag_collection=rag_collection,
+                    enable_web_search=enable_web_search,
+                    web_search_dense_threshold=web_search_dense_threshold,
+                    enable_vision=enable_vision,
+                )
+            )
+        return out
+
+    # ---------- Web 搜索触发逻辑 ----------
+
+    def _web_search_active(self, enable_web_search: bool) -> bool:
+        """请求级开关 ∧ 注入了 web_search_svc ∧ 服务自身 enabled。任一缺失就跳过。"""
+        return (
+            enable_web_search
+            and self.web_search_svc is not None
+            and getattr(self.web_search_svc, "enabled", False)
+        )
+
+    @staticmethod
+    def _should_trigger_web_search(
+        *,
+        term_count: int,
+        dense_top1: float | None,
+        sparse_hits: int,
+        dense_threshold: float,
+    ) -> bool:
+        """仅判断 dense top1 < 阈值。
+
+        ``dense_top1 is None`` 视为 0（无召回，触发）。
+        """
+        score = dense_top1 if dense_top1 is not None else 0.0
+        return score < dense_threshold
+
+    async def _maybe_web_search(
+        self,
+        query: str,
+        *,
+        term_matches: list[TermEntry],
+        diag: RAGDiagnostics,
+        enable_web_search: bool,
+        user_threshold: float | None,
+        enable_vision: bool = True,
+    ) -> tuple[list[WebSearchResult], bool]:
+        """单句路径用：判定 + 调用 Web 搜索。返回 (refs, triggered)。
+
+        永远不抛异常（WebSearchService 内部已静默降级）。
+        """
+        if not self._web_search_active(enable_web_search):
+            return [], False
+        thr = user_threshold if user_threshold is not None else self.default_web_search_dense_threshold
+        if not self._should_trigger_web_search(
+            term_count=len(term_matches),
+            dense_top1=diag.dense_top1,
+            sparse_hits=diag.sparse_hits,
+            dense_threshold=thr,
+        ):
+            return [], False
+        logger.info(
+            "web_search trigger query=%r dense_top1=%s sparse_hits=%d",
+            query[:30],
+            diag.dense_top1,
+            diag.sparse_hits,
+        )
+        try:
+            refs = await self.web_search_svc.search(query)  # type: ignore[union-attr]
+        except Exception as exc:  # WebSearchService 已经静默降级，这里只是双保险
+            logger.warning("web search 异常，降级为空参考: %s", exc)
+            refs = []
+
+        # 对第一条结果的配图做多模态分析（仅在有图且有 vision_svc 且启用视觉分析时）
+        if enable_vision and refs and self.vision_svc:
+            first = refs[0]
+            if first.image_url and first.image_analysis is None:
+                analysis = await self.vision_svc.analyze_image(first.image_url)
+                if analysis:
+                    refs[0] = first.model_copy(update={"image_analysis": analysis})
+
+        return refs, True
+
+    async def _group_web_search(
+        self,
+        cleaned: list[str],
+        *,
+        template_hint: str,
+        term_matches: list[TermEntry],
+        enable_rag: bool,
+        rag_threshold: float | None,
+        rag_collection: str | None,
+        enable_web_search: bool,
+        user_threshold: float | None,
+        enable_vision: bool = True,
+    ) -> tuple[list[WebSearchResult], bool]:
+        """整组/对话路径用：只对代表句发一次诊断查询并触发 Web 搜索。
+
+        代表句选择：``template_hint`` 非空时用 template_hint（组共有骨架），
+        否则退到 ``cleaned[0]``。
+        """
+        if not self._web_search_active(enable_web_search):
+            return [], False
+        if not enable_rag:
+            # RAG 关闭时没有诊断信息，认为是弱召回的扩展条件不成立 → 不触发
+            return [], False
+
+        rep_query = template_hint if template_hint else cleaned[0]
+        try:
+            _refs, diag = await self.rag_svc.search_with_diagnostics(
+                rep_query,
+                threshold=rag_threshold,
+                top_k=1,
+                collection=rag_collection,
+            )
+        except Exception as exc:
+            logger.warning("整组 RAG 诊断查询失败，跳过 web search: %s", exc)
+            return [], False
+
+        return await self._maybe_web_search(
+            rep_query,
+            term_matches=term_matches,
+            diag=diag,
+            enable_web_search=enable_web_search,
+            user_threshold=user_threshold,
+            enable_vision=enable_vision,
+        )
+
+    def _build_messages(
+        self,
+        source: str,
+        term_matches: list[TermEntry],
+        references: list[RAGSearchResult],
+        content_type: ContentType,
+        *,
+        web_refs: list[WebSearchResult] | None = None,
+    ) -> list[dict[str, str]]:
+        system = self.style_guide_svc.build_system_prompt_for_type(_BASE_SYSTEM, content_type)
+
+        parts: list[str] = []
+        if term_matches:
+            parts.append(
+                "## 术语参考（强烈推荐使用以下目标译文，除非语境明显冲突）"
+            )
+            parts.append(_format_term_section(term_matches))
+
+        if references:
+            parts.append(
+                "## 参考翻译（这是从游戏语料库中 RAG 检索到的相似句子，请根据 score 相似度分数进行参考）"
+            )
+            parts.append(_format_refs_section(references))
+
+        if web_refs:
+            parts.append(_WEB_SECTION_HEADER)
+            parts.append(_format_web_section(web_refs))
+
+        parts.append("## 待翻译文本")
+        parts.append(source)
+        parts.append(
+            "\n请以 JSON 格式输出（仅输出 JSON，不含任何其他文字或 markdown）：\n"
+            '{"translation": "英文译文", "reason": "用中文简述翻译理由，说明采用了哪些术语/RAG例句/网络资料，'
+            '或关键语境判断（1-2句话）"}'
+        )
+
+        user = "\n\n".join(parts)
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    def _build_group_messages(
+        self,
+        sources: list[str],
+        term_matches: list[TermEntry],
+        references: list[RAGSearchResult],
+        content_type: ContentType,
+        template_hint: str,
+        *,
+        web_refs: list[WebSearchResult] | None = None,
+    ) -> list[dict[str, str]]:
+        system = self.style_guide_svc.build_system_prompt_for_type(_BASE_SYSTEM, content_type)
+
+        intro_lines = [
+            f"以下 {len(sources)} 句中文源文本结构高度一致，请使用**完全一致的英文句式**翻译。",
+            "仅替换变量部分；句式骨架（前后缀、连接词、标点风格、大小写）必须 1:1 对应，"
+            "确保整组译文模板严格统一。",
+        ]
+        if template_hint:
+            intro_lines.append(f"识别出的共有结构提示：`{template_hint}`")
+
+        parts: list[str] = ["## 整组翻译任务", "\n".join(intro_lines)]
+
+        if term_matches:
+            parts.append(
+                "## 术语参考（强烈推荐使用以下目标译文，除非语境明显冲突）"
+            )
+            parts.append(_format_term_section(term_matches))
+
+        if references:
+            parts.append(
+                "## 参考翻译（从游戏语料库 RAG 检索到的相似句子，含相似度分数）"
+            )
+            parts.append(_format_refs_section(references))
+
+        if web_refs:
+            parts.append(_WEB_SECTION_HEADER)
+            parts.append(_format_web_section(web_refs))
+
+        parts.append("## 源文本")
+        parts.append("\n".join(f"{i}. {s}" for i, s in enumerate(sources, 1)))
+
+        parts.append(
+            "## 输出格式（严格遵守）\n"
+            '逐行输出，每行格式为 `序号. {"translation": "英文译文", "reason": "简述理由（中文，1句话）"}`，'
+            "序号与源文本编号严格对应，"
+            f"共 {len(sources)} 行。不要输出任何额外解释、标题或 Markdown。"
+        )
+
+        user = "\n\n".join(parts)
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    @staticmethod
+    def _term_used_view(term_matches: list[TermEntry]) -> list[dict]:
+        out: list[dict] = []
+        for entry in term_matches:
+            item = {"source": entry.source, "target": entry.target}
+            if entry.category:
+                item["category"] = entry.category
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _refs_view(references: list[RAGSearchResult]) -> list[dict] | None:
+        if not references:
+            return None
+        return [
+            {"source": r.source, "target": r.target, "score": round(r.score, 4)}
+            for r in references
+        ]
+
+    @staticmethod
+    def _web_view(web_refs: list[WebSearchResult] | None) -> list[dict] | None:
+        if not web_refs:
+            return None
+        return [r.model_dump() for r in web_refs]
+
+
+def _extract_translation_reason(text: str) -> tuple[str, str | None] | None:
+    """Regex 兜底：提取含未转义引号的残缺 JSON 中的 translation 和 reason。
+
+    translation 用 ``[^"]*`` 匹配（英文译文通常不含裸引号）；
+    reason 用贪婪 ``.*`` 配合末尾 ``"\\s*}`` 锚点，正确吞掉内嵌引号。
+    返回 None 表示未能提取 translation 字段。
+    """
+    trans_m = re.search(r'"translation"\s*:\s*"([^"]*)"', text)
+    if not trans_m:
+        return None
+    reason_m = re.search(r'"reason"\s*:\s*"(.*)"[\s\n]*\}', text, re.DOTALL)
+    reason = reason_m.group(1).strip() if reason_m else None
+    return trans_m.group(1).strip(), reason or None
+
+
+def _parse_single_llm_output(raw: str) -> tuple[str, str | None]:
+    """从单句 LLM 输出中提取译文和理由。
+
+    期望格式：``{"translation": "...", "reason": "..."}``。
+    JSON 解析失败时尝试 regex 兜底；仍失败则将整体内容当作译文，理由返回 None。
+    """
+    text = raw.strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "translation" in data:
+            translation = str(data["translation"]).strip()
+            reason = str(data.get("reason", "") or "").strip() or None
+            return translation, reason
+    except (json.JSONDecodeError, ValueError):
+        pass
+    result = _extract_translation_reason(text)
+    if result is not None:
+        return result
+    return text, None
+
+
+def _parse_line_text(text: str) -> tuple[str, str | None]:
+    """从编号行的正文部分解析译文和理由。
+
+    期望格式：``{"translation": "...", "reason": "..."}``。
+    JSON 解析失败时尝试 regex 兜底；仍失败则将整体当译文，理由返回 None。
+    """
+    text = text.strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "translation" in data:
+            translation = str(data["translation"]).strip()
+            reason = str(data.get("reason", "") or "").strip() or None
+            return translation, reason
+    except (json.JSONDecodeError, ValueError):
+        pass
+    result = _extract_translation_reason(text)
+    if result is not None:
+        return result
+    return text, None
+
+
+def _parse_numbered_output_positional(
+    raw: str, expected: int
+) -> list[tuple[str, str | None]] | None:
+    """按位置解析 LLM 编号输出，宽容编号数值本身。
+
+    要求严格匹配 ``expected`` 行带数字前缀的输出，按出现顺序映射到原文位置；
+    实际数字（``1`` / ``11000`` / 跳号等）不参与校验。仅当数字编号行数 ≠ expected
+    时返回 None 触发上层 fallback。
+
+    每行正文尝试解析为 ``{"translation": ..., "reason": ...}``，失败时整体当译文。
+    """
+    if not raw or expected <= 0:
+        return None
+    items: list[tuple[str, str | None]] = []
+    for line in raw.splitlines():
+        m = _NUMBERED_LINE_RE.match(line)
+        if not m:
+            continue
+        text = m.group(2).strip()
+        if not text:
+            continue
+        items.append(_parse_line_text(text))
+    if len(items) != expected:
+        return None
+    return items
+
+
+def _parse_numbered_output(raw: str, expected: int) -> list[tuple[str, str | None]] | None:
+    """解析 LLM 整组输出为按序号排序的 (译文, 理由) 列表。
+
+    要求严格匹配 ``expected`` 条、且序号集合恰好为 ``{1..expected}``；
+    否则返回 None 触发上层 fallback。
+
+    每行正文尝试解析为 ``{"translation": ..., "reason": ...}``，失败时整体当译文。
+    """
+    if not raw or expected <= 0:
+        return None
+    found: dict[int, tuple[str, str | None]] = {}
+    for line in raw.splitlines():
+        m = _NUMBERED_LINE_RE.match(line)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        text = m.group(2).strip()
+        if not text:
+            continue
+        # 同一序号重复时保留首条
+        found.setdefault(idx, _parse_line_text(text))
+    if len(found) != expected:
+        return None
+    if set(found.keys()) != set(range(1, expected + 1)):
+        return None
+    return [found[i] for i in range(1, expected + 1)]
+
+
+def _format_term_section(term_matches: list[TermEntry]) -> str:
+    lines = []
+    for entry in term_matches:
+        cat = f"（{entry.category}）" if entry.category else ""
+        lines.append(f'- 「{entry.source}」{cat} → "{entry.target}"')
+    return "\n".join(lines)
+
+
+def _format_dialog_lines(sources: list[str], speakers: list[str | None]) -> str:
+    """格式化为 ``1. [说话人] 原文`` 形式；说话人缺失时直接 ``1. 原文``。
+
+    刻意**不**把 ``time`` 写进 prompt：游戏里 ``time`` 字段可能是大整数（如 11000+），
+    曾出现 LLM 把 ``(t=11000)`` 当成行号输出导致解析失败的 bug。``time`` 只用于排序。
+    """
+    lines: list[str] = []
+    for i, src in enumerate(sources, 1):
+        speaker = (speakers[i - 1] or "").strip() if speakers else ""
+        if speaker:
+            lines.append(f"{i}. [{speaker}] {src}")
+        else:
+            lines.append(f"{i}. {src}")
+    return "\n".join(lines)
+
+
+def _format_refs_section(references: list[RAGSearchResult]) -> str:
+    lines = []
+    for i, r in enumerate(references, 1):
+        lines.append(
+            f'{i}. [score={r.score:.3f}] 「{r.source}」 → "{r.target}"'
+        )
+    return "\n".join(lines)
+
+
+def _format_web_section(web_refs: list[WebSearchResult]) -> str:
+    """格式化网络参考段。image_analysis 优先于裸 image_url 注入 prompt。"""
+    blocks: list[str] = []
+    for i, r in enumerate(web_refs, 1):
+        site = f" — {r.site_name}" if r.site_name else ""
+        title_line = f"{i}. 「{r.title}」{site}"
+        lines = [title_line, f"   摘要：{r.snippet}", f"   链接：{r.url}"]
+        if r.image_analysis:
+            lines.append(f"   配图视觉分析（多模态AI）：{r.image_analysis}")
+        elif r.image_url:
+            lines.append(f"   配图：{r.image_url}")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
+def _extract_image_analysis(web_refs: list[WebSearchResult] | None) -> str | None:
+    """从 web_refs 中提取第一个非空的 image_analysis。"""
+    if not web_refs:
+        return None
+    for r in web_refs:
+        if r.image_analysis:
+            return r.image_analysis
+    return None
+
+
+__all__ = ["TranslationPipeline"]
