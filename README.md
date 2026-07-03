@@ -1,5 +1,44 @@
 # aipe-mvp
 
+<!-- bilingual-readme:start -->
+
+## 双语说明 / Bilingual Documentation
+
+> 本节提供整篇 README 的中英双语维护说明；下方保留原始详细说明、命令、路径和配置示例。
+> This section provides bilingual maintenance notes for the full README; the original detailed notes, commands, paths, and configuration examples are preserved below.
+
+### 中文
+
+**概览**：《燕云十六声》中译英游戏本地化 AI 翻译服务，基于 FastAPI、Qdrant、术语库、风格指南和 RAG 召回。
+
+**主要能力**：
+- 提供 API 化翻译服务。
+- 用向量检索召回翻译记忆和参考语料。
+- 结合术语、风格指南和 Web 搜索兜底。
+
+**使用方式**：按下方部署说明配置服务、向量库和项目资源后启动 FastAPI。
+
+**状态**：该仓库仍按当前 README 的说明维护或使用。
+
+**注意事项**：项目事实以 README 下方的服务结构和配置说明为准。
+
+### English
+
+**Overview**: ZH-to-EN game-localization translation service for Where Winds Meet, built with FastAPI, Qdrant, terminology, style guides, and RAG retrieval.
+
+**Key capabilities**:
+- Provides an API-based translation service.
+- Uses vector retrieval for translation memory and reference corpora.
+- Combines terminology, style guides, and web-search fallback.
+
+**Usage**: Configure the service, vector store, and project resources as described below, then start FastAPI.
+
+**Status**: This repository is maintained or used according to the current README notes.
+
+**Notes**: Repository facts follow the service structure and configuration details below.
+
+<!-- bilingual-readme:end -->
+
 《燕云十六声》中译英游戏本地化 AI 翻译服务。FastAPI + Qdrant 向量检索 + LLM，带术语库、风格指南、RAG 召回和 Web 搜索兜底。
 
 ## 能力
