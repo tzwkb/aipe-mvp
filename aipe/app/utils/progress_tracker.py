@@ -72,6 +72,7 @@ class ProgressTracker:
         content_types: list[str | None] | None = None,
         units: list[list[int]] | None = None,
         orig_to_unique: list[int] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """初始化进度文件。已存在则按现状返回，便于断点续传。
 
@@ -80,6 +81,7 @@ class ProgressTracker:
 
         ``orig_to_unique`` 是"原始索引 → unique 索引"的映射，用于去重后的 fan-out。
         """
+        requested_context = _normalize_context(context)
         async with self._lock:
             if self.file_path.exists():
                 state = self.load()
@@ -90,6 +92,25 @@ class ProgressTracker:
                         self.task_id,
                         state.get("total"),
                         total,
+                    )
+                mismatches = _state_mismatches(
+                    state,
+                    {
+                        "total": total,
+                        "batch_size": batch_size,
+                        "total_batches": total_batches,
+                        "sources": sources or [],
+                        "content_types": content_types or [],
+                        "units": units or [],
+                        "orig_to_unique": orig_to_unique or [],
+                        "context": requested_context,
+                    },
+                )
+                if mismatches:
+                    joined = ", ".join(mismatches)
+                    raise ValueError(
+                        f"断点续传任务 {self.task_id} 的输入/上下文不一致: {joined}; "
+                        "请使用新的 task_id 或清理旧 progress 文件"
                     )
                 return state
 
@@ -104,6 +125,7 @@ class ProgressTracker:
                     "content_types": content_types or [],
                     "units": units or [],
                     "orig_to_unique": orig_to_unique or [],
+                    "context": requested_context,
                     "created_at": _now_iso(),
                     "last_updated": _now_iso(),
                 }
@@ -154,9 +176,37 @@ class ProgressTracker:
             "content_types": [],
             "units": [],
             "orig_to_unique": [],
+            "context": {},
             "created_at": None,
             "last_updated": None,
         }
+
+
+def _normalize_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    if not context:
+        return {}
+    return {k: v for k, v in context.items() if v is not None}
+
+
+def _state_mismatches(state: dict[str, Any], requested: dict[str, Any]) -> list[str]:
+    mismatches: list[str] = []
+    if state.get("total") != requested["total"]:
+        mismatches.append("total")
+
+    for key in ("batch_size", "total_batches", "sources", "content_types", "units", "orig_to_unique"):
+        existing = state.get(key)
+        if existing and existing != requested[key]:
+            mismatches.append(key)
+
+    existing_context = state.get("context") or {}
+    requested_context = requested.get("context") or {}
+    if existing_context or requested_context:
+        if not existing_context and requested_context:
+            return mismatches
+        if existing_context != requested_context:
+            changed = sorted(set(existing_context) | set(requested_context))
+            mismatches.extend(f"context.{key}" for key in changed if existing_context.get(key) != requested_context.get(key))
+    return mismatches
 
 
 def _now_iso() -> str:

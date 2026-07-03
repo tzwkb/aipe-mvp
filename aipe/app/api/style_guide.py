@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 
 from app.errors import StyleGuideError
 from app.schemas.style_guide import (
     StyleGuideInfoResponse,
     StyleGuideUploadResponse,
+)
+from app.services.project_service import (
+    ProjectProfileError,
+    ProjectResourceManager,
+    get_project_resource_manager,
 )
 from app.services.style_guide_service import (
     StyleGuideService,
@@ -30,7 +35,9 @@ _PREVIEW_LEN = 500
 )
 async def upload_style_guide(
     file: UploadFile = File(..., description="风格指南文件，.txt / .md / .markdown"),
+    project_id: str | None = Query(None, description="项目档案 ID，如 wwm/zh-en；不填使用旧全局风格指南"),
     svc: StyleGuideService = Depends(get_style_guide_service),
+    project_resources: ProjectResourceManager = Depends(get_project_resource_manager),
 ) -> StyleGuideUploadResponse:
     filename = file.filename or "style_guide"
     try:
@@ -40,7 +47,12 @@ async def upload_style_guide(
 
     try:
         text = parse_style_guide_bytes(raw, filename)
-        svc.load(text, filename=filename)
+        if project_id:
+            svc = project_resources.replace_style_guide(project_id, text, filename=filename)
+        else:
+            svc.load(text, filename=filename)
+    except ProjectProfileError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except StyleGuideError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -60,8 +72,16 @@ async def upload_style_guide(
 )
 async def get_style_guide(
     full: bool = False,
+    project_id: str | None = Query(None, description="项目档案 ID，如 wwm/zh-en；不填查询旧全局风格指南"),
     svc: StyleGuideService = Depends(get_style_guide_service),
+    project_resources: ProjectResourceManager = Depends(get_project_resource_manager),
 ) -> StyleGuideInfoResponse:
+    try:
+        if project_id:
+            svc = project_resources.style_guide(project_id)
+    except ProjectProfileError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     info = svc.info()
     rules = svc.get_rules()
     return StyleGuideInfoResponse(

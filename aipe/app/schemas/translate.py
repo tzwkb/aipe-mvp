@@ -10,6 +10,7 @@ class TranslateRequest(BaseModel):
     rag_threshold: float = Field(0.85, ge=0.0, le=1.0, description="RAG 相似度阈值")
     rag_top_k: int = Field(3, ge=1, le=10, description="RAG 返回 Top-K")
     rag_collection: str | None = Field(None, description="指定 RAG 检索的 Qdrant collection 名，不填则用默认值")
+    project_id: str | None = Field(None, description="项目档案 ID，如 wwm/zh-en；不填使用默认项目或旧全局状态")
     task_id: str | None = Field(None, description="任务ID（断点续传用）")
     content_types: list[str | None] | None = Field(
         None, description="每句对应的文本类型（与 texts 一一对应），有则跳过 LLM 预分类"

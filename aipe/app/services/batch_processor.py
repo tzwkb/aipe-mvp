@@ -70,6 +70,7 @@ class BatchProcessor:
         texts: list[str],
         task_id: str,
         *,
+        project_id: str | None = None,
         enable_rag: bool = True,
         rag_threshold: float | None = None,
         rag_top_k: int | None = None,
@@ -98,6 +99,8 @@ class BatchProcessor:
         一一对应，传入非空值时直接复用。
         """
         bs = batch_size or self.batch_size
+        effective_project_id = project_id or self.settings.default_project
+        effective_cluster: bool | None = None
         total_orig = len(texts)
         cts = content_types or [None] * total_orig
         if len(cts) != total_orig:
@@ -176,6 +179,18 @@ class BatchProcessor:
             content_types=unique_types,
             units=[list(u.indices) for u in units],
             orig_to_unique=orig_to_unique,
+            context={
+                "project_id": effective_project_id,
+                "rag_collection": rag_collection,
+                "enable_rag": bool(enable_rag),
+                "rag_threshold": rag_threshold,
+                "rag_top_k": rag_top_k,
+                "enable_web_search": bool(enable_web_search),
+                "web_search_dense_threshold": web_search_dense_threshold,
+                "enable_vision": bool(enable_vision),
+                "dialog_mode": bool(dialog_mode),
+                "enable_cluster": effective_cluster,
+            },
         )
         completed = set(state.get("completed_indices", []))
         if completed:
@@ -203,6 +218,7 @@ class BatchProcessor:
                         enable_web_search=enable_web_search,
                         web_search_dense_threshold=web_search_dense_threshold,
                         enable_vision=enable_vision,
+                        project_id=effective_project_id,
                     )
                 elif unit.kind == "dialog":
                     dialog_ct = next((ct for ct in unit_cts if ct), None)
@@ -219,6 +235,7 @@ class BatchProcessor:
                         enable_web_search=enable_web_search,
                         web_search_dense_threshold=web_search_dense_threshold,
                         enable_vision=enable_vision,
+                        project_id=effective_project_id,
                     )
                 else:
                     results = await self._run_singles(
@@ -231,6 +248,7 @@ class BatchProcessor:
                         enable_web_search=enable_web_search,
                         web_search_dense_threshold=web_search_dense_threshold,
                         enable_vision=enable_vision,
+                        project_id=effective_project_id,
                     )
                 await tracker.save_batch(
                     idx, [r.model_dump(mode="json") for r in results]
@@ -403,6 +421,7 @@ class BatchProcessor:
         enable_web_search: bool = False,
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
+        project_id: str | None = None,
     ) -> list[TranslationResult]:
         from app.services.style_guide_service import ContentType
 
@@ -429,6 +448,7 @@ class BatchProcessor:
                 enable_web_search=enable_web_search,
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
+                project_id=project_id,
             )
         except Exception as exc:  # 兜底：理论上 translate_group 不抛
             logger.exception("translate_group 兜底捕获: %s", exc)
@@ -457,6 +477,7 @@ class BatchProcessor:
         enable_web_search: bool = False,
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
+        project_id: str | None = None,
     ) -> list[TranslationResult]:
         from app.services.style_guide_service import ContentType
 
@@ -485,6 +506,7 @@ class BatchProcessor:
                 enable_web_search=enable_web_search,
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
+                project_id=project_id,
             )
         except Exception as exc:  # 兜底：理论上 translate_dialog 不抛
             logger.exception(
@@ -512,6 +534,7 @@ class BatchProcessor:
         enable_web_search: bool = False,
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
+        project_id: str | None = None,
     ) -> list[TranslationResult]:
         from app.services.style_guide_service import ContentType
 
@@ -540,6 +563,7 @@ class BatchProcessor:
                     enable_web_search=enable_web_search,
                     web_search_dense_threshold=web_search_dense_threshold,
                     enable_vision=enable_vision,
+                    project_id=project_id,
                 )
             except Exception as exc:  # 兜底：理论上 translate_single 不抛
                 logger.exception("translate_single 兜底捕获: %s", exc)

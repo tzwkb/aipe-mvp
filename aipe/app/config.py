@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     qdrant_port: int = 6333
     qdrant_collection: str = "yanyun_corpus"
 
+    # Project profiles
+    projects_dir: str = "./data/projects"
+    default_project: str | None = None
+
     # RAG (hybrid: dense + BM25 + RRF)
     # rag_threshold 仅作用在 dense 路召回（RRF 融合分与 cosine 不可比，故不在融合后过滤）。
     rag_threshold: float = 0.5

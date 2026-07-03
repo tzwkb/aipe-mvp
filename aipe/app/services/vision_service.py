@@ -2,7 +2,7 @@
 
 调用 qwen3.6-plus（与主 LLM 共用同一网关 base_url / api_key）。
 失败模式：所有异常静默降级返回 None，上层永远不会收到异常。
-内置按图片 URL 的进程内内存缓存，同一图片在进程内只调用一次。
+内置按图片 URL + system prompt 的进程内内存缓存。
 """
 
 from __future__ import annotations
@@ -41,14 +41,15 @@ class VisionService:
             timeout=30.0,
             max_retries=0,
         )
-        self._cache: dict[str, str] = {}
+        self._cache: dict[tuple[str, str], str] = {}
 
-    async def analyze_image(self, image_url: str) -> str | None:
+    async def analyze_image(self, image_url: str, *, system_prompt: str | None = None) -> str | None:
         """分析图片，返回对翻译有用的文字描述。失败或图片 URL 为空时返回 None。"""
         if not image_url or not image_url.strip():
             return None
 
-        cached = self._cache.get(image_url)
+        cache_key = (image_url, system_prompt or _SYSTEM_PROMPT)
+        cached = self._cache.get(cache_key)
         if cached is not None:
             logger.debug("vision cache hit url=%r", image_url)
             return cached
@@ -58,7 +59,7 @@ class VisionService:
             resp = await self._client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt or _SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": [
@@ -72,7 +73,7 @@ class VisionService:
             )
             result = (resp.choices[0].message.content or "").strip() or None
             if result:
-                self._cache[image_url] = result
+                self._cache[cache_key] = result
                 logger.info("vision done url=%r chars=%d", image_url, len(result))
             return result
         except Exception as exc:

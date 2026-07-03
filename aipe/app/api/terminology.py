@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 
 from app.errors import TerminologyError
 from app.schemas.terminology import (
     TerminologyListResponse,
     TerminologyUploadResponse,
+)
+from app.services.project_service import (
+    ProjectProfileError,
+    ProjectResourceManager,
+    get_project_resource_manager,
 )
 from app.services.terminology_service import (
     TerminologyService,
@@ -30,7 +35,9 @@ _ALLOWED_SUFFIX = {".xlsx", ".xls", ".csv"}
 )
 async def upload_terminology(
     file: UploadFile = File(..., description="术语表文件，.xlsx / .xls / .csv"),
+    project_id: str | None = Query(None, description="项目档案 ID，如 wwm/zh-en；不填使用旧全局术语表"),
     svc: TerminologyService = Depends(get_terminology_service),
+    project_resources: ProjectResourceManager = Depends(get_project_resource_manager),
 ) -> TerminologyUploadResponse:
     filename = file.filename or "uploaded"
     suffix = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
@@ -53,30 +60,39 @@ async def upload_terminology(
     if not parsed:
         raise HTTPException(status_code=400, detail="术语表为空或全部行无效")
 
-    previous_total = len(svc.entries)
-    previous_sources = set(svc.term_dict.keys())
+    try:
+        target_svc = project_resources.terminology(project_id) if project_id else svc
+    except ProjectProfileError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    svc.load(parsed)
+    previous_total = len(target_svc.entries)
+    previous_sources = set(target_svc.term_dict.keys())
 
-    new_sources = set(svc.term_dict.keys())
+    if project_id:
+        target_svc = project_resources.replace_terminology(project_id, parsed)
+    else:
+        target_svc.load(parsed)
+
+    new_sources = set(target_svc.term_dict.keys())
     added = len(new_sources - previous_sources)
     updated = len(new_sources & previous_sources)
     logger.info(
-        "术语表上传完成: filename=%s parsed=%d total=%d added=%d updated=%d duplicates=%d",
+        "术语表上传完成: filename=%s project_id=%s parsed=%d total=%d added=%d updated=%d duplicates=%d",
         filename,
+        project_id,
         len(parsed),
-        len(svc.entries),
+        len(target_svc.entries),
         added,
         updated,
-        svc.duplicate_count,
+        target_svc.duplicate_count,
     )
     return TerminologyUploadResponse(
-        total=len(svc.entries),
+        total=len(target_svc.entries),
         added=added,
         updated=updated,
         message=(
             f"术语表加载成功，previous_total={previous_total}, "
-            f"duplicates_skipped={svc.duplicate_count}"
+            f"duplicates_skipped={target_svc.duplicate_count}"
         ),
     )
 
@@ -89,11 +105,17 @@ async def upload_terminology(
 async def list_terminology(
     limit: int = 100,
     offset: int = 0,
+    project_id: str | None = Query(None, description="项目档案 ID，如 wwm/zh-en；不填查询旧全局术语表"),
     svc: TerminologyService = Depends(get_terminology_service),
+    project_resources: ProjectResourceManager = Depends(get_project_resource_manager),
 ) -> TerminologyListResponse:
     if limit < 1 or limit > 1000:
         raise HTTPException(status_code=400, detail="limit 取值范围 [1, 1000]")
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset 不能为负")
-    items = svc.entries[offset : offset + limit]
-    return TerminologyListResponse(total=len(svc.entries), items=items)
+    try:
+        target_svc = project_resources.terminology(project_id) if project_id else svc
+    except ProjectProfileError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    items = target_svc.entries[offset : offset + limit]
+    return TerminologyListResponse(total=len(target_svc.entries), items=items)

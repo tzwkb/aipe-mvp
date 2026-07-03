@@ -7,6 +7,10 @@ from fastapi import Depends
 from app.config import Settings, get_settings
 from app.services.batch_processor import BatchProcessor
 from app.services.llm_service import LLMService
+from app.services.project_service import (
+    ProjectResourceManager,
+    get_project_resource_manager,
+)
 from app.services.rag_service import RAGService, get_rag_service
 from app.services.style_guide_service import (
     StyleGuideService,
@@ -65,6 +69,7 @@ def _build_pipeline() -> TranslationPipeline:
         web_search_svc=get_web_search_service(),
         web_search_dense_threshold=settings.web_search_dense_threshold,
         vision_svc=get_vision_service(),
+        project_resources=get_project_resource_manager(),
     )
 
 
@@ -93,6 +98,7 @@ __all__ = [
     "get_rag_service",
     "get_web_search_service",
     "get_vision_service",
+    "get_project_resource_manager",
     "get_translation_pipeline",
     "get_batch_processor",
     "LLMService",
@@ -101,6 +107,7 @@ __all__ = [
     "RAGService",
     "WebSearchService",
     "VisionService",
+    "ProjectResourceManager",
     "TranslationPipeline",
     "BatchProcessor",
 ]

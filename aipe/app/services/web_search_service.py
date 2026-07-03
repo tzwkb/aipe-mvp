@@ -84,7 +84,7 @@ class WebSearchService:
 
     # ---------- 对外入口 ----------
 
-    async def search(self, query: str) -> list[WebSearchResult]:
+    async def search(self, query: str, *, prefix: str | None = None) -> list[WebSearchResult]:
         """主入口：缓存命中直接返回；否则发实网；同 query 并发去重。
 
         永远不抛异常（任何失败都返回空列表）。
@@ -92,7 +92,8 @@ class WebSearchService:
         if not self.enabled or not query or not query.strip():
             return []
 
-        key = _cache_key(query)
+        query_combined = f"{prefix.strip()} {query}".strip() if prefix and prefix.strip() else query
+        key = _cache_key(query_combined)
 
         cached = self._read_cache(key)
         if cached is not None:
@@ -104,7 +105,7 @@ class WebSearchService:
         if existing is not None:
             return await existing
 
-        task = asyncio.create_task(self._do_search(query, key))
+        task = asyncio.create_task(self._do_search(query, key, query_combined=query_combined))
         self._inflight[key] = task
         try:
             return await task
@@ -117,9 +118,9 @@ class WebSearchService:
 
     # ---------- 实际执行 ----------
 
-    async def _do_search(self, query: str, key: str) -> list[WebSearchResult]:
+    async def _do_search(self, query: str, key: str, *, query_combined: str | None = None) -> list[WebSearchResult]:
         assert self._client is not None  # enabled=True 时 client 必有
-        query_combined = "燕云十六声 " + query
+        query_combined = query_combined or query
         payload = {"query": query_combined, "summary": self.summary, "count": self.count}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -129,7 +130,6 @@ class WebSearchService:
         attempts = max(1, self.max_retries + 1)
         last_status: int | None = None
         last_exc: Exception | None = None
-        print(payload)
         for attempt in range(1, attempts + 1):
             try:
                 resp = await self._client.post(self.endpoint, json=payload, headers=headers)

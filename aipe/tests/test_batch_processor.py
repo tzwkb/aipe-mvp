@@ -21,6 +21,7 @@ class FakePipeline:
     def __init__(self, *, fail_for: set[str] | None = None, sleep_each: float = 0.0):
         self.calls: list[str] = []
         self.group_calls: list[list[str]] = []
+        self.project_ids: list[str | None] = []
         self.fail_for = fail_for or set()
         self.sleep_each = sleep_each
 
@@ -35,8 +36,11 @@ class FakePipeline:
         rag_collection=None,
         enable_web_search=False,
         web_search_dense_threshold=None,
+        enable_vision=True,
+        project_id=None,
     ):
         self.calls.append(text)
+        self.project_ids.append(project_id)
         if self.sleep_each:
             await asyncio.sleep(self.sleep_each)
         if text in self.fail_for:
@@ -63,8 +67,11 @@ class FakePipeline:
         rag_collection=None,
         enable_web_search=False,
         web_search_dense_threshold=None,
+        enable_vision=True,
+        project_id=None,
     ):
         self.group_calls.append(list(sources))
+        self.project_ids.append(project_id)
         if self.sleep_each:
             await asyncio.sleep(self.sleep_each)
         return [
@@ -199,6 +206,27 @@ def test_process_clusters_templates_into_group_unit(tmp_path):
     # 模板组译文带 [G] 前缀（来自 FakePipeline.translate_group）
     assert resp.results[0].translation == "[G]活动【柿业有成】获取".upper()
     assert resp.results[1].translation == "无关短句一".upper()
+
+
+def test_process_forwards_project_id_to_pipeline(tmp_path):
+    pipe = FakePipeline()
+    proc = BatchProcessor(pipe, _settings(tmp_path, batch_size=50))  # type: ignore[arg-type]
+
+    asyncio.run(proc.process(["一句散句"], task_id="t_project", project_id="nrc/zh-en"))
+
+    assert pipe.project_ids == ["nrc/zh-en"]
+
+
+def test_process_rejects_resume_when_project_context_changes(tmp_path):
+    pipe1 = FakePipeline()
+    proc1 = BatchProcessor(pipe1, _settings(tmp_path, batch_size=50))  # type: ignore[arg-type]
+    asyncio.run(proc1.process(["一句散句"], task_id="t_project_context", project_id="isekai/en-de"))
+
+    pipe2 = FakePipeline()
+    proc2 = BatchProcessor(pipe2, _settings(tmp_path, batch_size=50))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="project_id"):
+        asyncio.run(proc2.process(["一句散句"], task_id="t_project_context", project_id="isekai/en-fr"))
 
 
 def test_process_cluster_resume_preserves_order(tmp_path):
@@ -424,6 +452,8 @@ class FakePipelineWithDialog(FakePipeline):
         rag_collection=None,
         enable_web_search=False,
         web_search_dense_threshold=None,
+        enable_vision=True,
+        project_id=None,
     ):
         self.dialog_calls.append(
             {

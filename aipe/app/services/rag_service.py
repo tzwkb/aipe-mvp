@@ -138,14 +138,24 @@ class RAGService:
         self.dense_prefetch = settings.rag_dense_prefetch
         self.sparse_prefetch = settings.rag_sparse_prefetch
 
-        self._client = AsyncQdrantClient(
-            host=settings.qdrant_host,
-            port=settings.qdrant_port,
-            timeout=30.0,
-        )
+        self._client_instance: AsyncQdrantClient | None = None
+        self._client_loop: asyncio.AbstractEventLoop | None = None
         self._vector_size: int | None = None
         self._collection_ready: set[str] = set()
         self._init_lock = asyncio.Lock()
+
+    @property
+    def _client(self) -> AsyncQdrantClient:
+        loop = asyncio.get_running_loop()
+        if self._client_instance is None or self._client_loop is not loop:
+            self._client_instance = AsyncQdrantClient(
+                host=self.settings.qdrant_host,
+                port=self.settings.qdrant_port,
+                timeout=30.0,
+            )
+            self._client_loop = loop
+            self._init_lock = asyncio.Lock()
+        return self._client_instance
 
     # ---------- collection 初始化 ----------
 
@@ -156,6 +166,7 @@ class RAGService:
         """
         if collection in self._collection_ready:
             return
+        _ = self._client
         async with self._init_lock:
             if collection in self._collection_ready:
                 return
@@ -463,7 +474,14 @@ class RAGService:
         await self._ensure_collection(coll)
 
     async def aclose(self) -> None:
-        await self._client.close()
+        if self._client_instance is None:
+            return
+        try:
+            await self._client_instance.close()
+        finally:
+            self._client_instance = None
+            self._client_loop = None
+            self._init_lock = asyncio.Lock()
 
 
 # ---------- 模块级单例 ----------

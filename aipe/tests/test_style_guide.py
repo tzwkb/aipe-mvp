@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import get_settings
 from app.errors import StyleGuideError
 from app.main import app
+from app.services.project_service import reset_project_services
 from app.services.style_guide_service import (
     StyleGuideService,
     reset_style_guide_service,
@@ -14,9 +18,33 @@ from app.utils.file_parser import parse_style_guide_bytes
 
 @pytest.fixture(autouse=True)
 def _reset_singleton():
+    get_settings.cache_clear()
+    reset_project_services()
     reset_style_guide_service()
     yield
     reset_style_guide_service()
+    reset_project_services()
+    get_settings.cache_clear()
+
+
+def _write_project(root, name: str, style: str) -> None:
+    project_dir = root / name
+    project_dir.mkdir(parents=True)
+    (project_dir / "style.md").write_text(style, encoding="utf-8")
+    (project_dir / "profile.json").write_text(
+        json.dumps(
+            {
+                "name": name,
+                "language_pair": "ZH-EN",
+                "source_lang": "zh",
+                "target_lang": "en",
+                "game": name,
+                "style_guide": "style.md",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
 
 # ---------- file_parser ----------
@@ -202,3 +230,31 @@ def test_upload_rejects_empty_body():
     files = {"file": ("guide.md", b"   \n\n", "text/markdown")}
     resp = client.post("/api/v1/style-guide/upload", files=files)
     assert resp.status_code == 400
+
+
+def test_project_id_gets_and_uploads_project_style_guide(tmp_path, monkeypatch):
+    projects = tmp_path / "projects"
+    _write_project(projects, "wwm/zh-en", "WWM style")
+    monkeypatch.setenv("PROJECTS_DIR", str(projects))
+    monkeypatch.setenv("DEFAULT_PROJECT", "wwm/zh-en")
+    get_settings.cache_clear()
+    reset_project_services()
+    client = TestClient(app)
+
+    resp = client.get("/api/v1/style-guide?project_id=wwm/zh-en&full=true")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["loaded"] is True
+    assert body["rules"] == "WWM style"
+
+    files = {"file": ("guide.md", b"NRC style", "text/markdown")}
+    resp = client.post("/api/v1/style-guide/upload?project_id=wwm/zh-en", files=files)
+    assert resp.status_code == 200, resp.text
+
+    resp = client.get("/api/v1/style-guide?project_id=wwm/zh-en&full=true")
+    assert resp.status_code == 200
+    assert resp.json()["rules"] == "NRC style"
+
+    resp = client.get("/api/v1/style-guide")
+    assert resp.status_code == 200
+    assert resp.json()["loaded"] is False

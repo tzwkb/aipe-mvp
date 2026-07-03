@@ -58,6 +58,7 @@ async def translate(
     return await processor.process(
         texts=request.texts,
         task_id=task_id,
+        project_id=request.project_id,
         enable_rag=request.enable_rag,
         rag_threshold=request.rag_threshold,
         rag_top_k=request.rag_top_k,
@@ -90,6 +91,7 @@ async def translate_file(
             "需要文件中包含 id / 说话人 / time 列。"
         ),
     ),
+    project_id: str | None = Form(None, description="项目档案 ID，如 wwm/zh-en；不填使用默认项目或旧全局状态"),
     rag_collection: str | None = Form(None, description="指定 RAG 检索的 Qdrant collection 名，不填则用默认值"),
     enable_web_search: bool = Form(
         False,
@@ -153,6 +155,7 @@ async def translate_file(
     return await processor.process(
         texts=texts,
         task_id=tid,
+        project_id=project_id,
         enable_rag=enable_rag,
         rag_threshold=rag_threshold,
         rag_top_k=rag_top_k,

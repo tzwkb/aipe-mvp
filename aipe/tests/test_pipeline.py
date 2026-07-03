@@ -6,10 +6,12 @@ LLM / Embedding 全部用 fake 实现，不依赖任何外部服务。
 from __future__ import annotations
 
 import asyncio
+import json
 
 from app.schemas.rag import RAGSearchResult
 from app.schemas.terminology import TermEntry
 from app.schemas.web_search import WebSearchResult
+from app.services.project_service import ProjectRegistry, ProjectResourceManager
 from app.services.rag_service import RAGDiagnostics
 from app.services.style_guide_service import StyleGuideService
 from app.services.terminology_service import TerminologyService
@@ -65,9 +67,11 @@ class FakeRAG:
         self.diag_calls: list[str] = []
         self._diag_default = diagnostics or RAGDiagnostics(dense_top1=0.9, sparse_hits=1)
         self._diag_by_query = diagnostics_by_query or {}
+        self.collection_calls: list[str | None] = []
 
     async def search(self, query, threshold=None, top_k=None, collection=None):
         self.calls.append((query, threshold, top_k))
+        self.collection_calls.append(collection)
         if self._raise:
             raise self._raise
         if query in self._by_query:
@@ -76,6 +80,7 @@ class FakeRAG:
 
     async def search_with_diagnostics(self, query, threshold=None, top_k=None, collection=None):
         self.calls.append((query, threshold, top_k))
+        self.collection_calls.append(collection)
         self.diag_calls.append(query)
         if self._raise:
             raise self._raise
@@ -98,7 +103,7 @@ class FakeWebSearch:
         self._raise = raise_exc
         self.calls: list[str] = []
 
-    async def search(self, query: str):
+    async def search(self, query: str, *, prefix: str | None = None):
         self.calls.append(query)
         if self._raise:
             raise self._raise
@@ -137,6 +142,70 @@ def _make_pipeline(
     return pipe, term_svc, rag, llm
 
 
+def _write_project(
+    root,
+    name: str,
+    *,
+    language_pair: str = "ZH-EN",
+    source_lang: str = "zh",
+    target_lang: str = "en",
+    term_source: str,
+    term_target: str,
+    style: str,
+    collection: str,
+) -> None:
+    project_dir = root / name
+    project_dir.mkdir(parents=True)
+    (project_dir / "terms.json").write_text(
+        json.dumps([{"source": term_source, "target": term_target}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (project_dir / "style.md").write_text(style, encoding="utf-8")
+    (project_dir / "profile.json").write_text(
+        json.dumps(
+            {
+                "name": name,
+                "language_pair": language_pair,
+                "source_lang": source_lang,
+                "target_lang": target_lang,
+                "game": name,
+                "style_guide": "style.md",
+                "terminology": "terms.json",
+                "qdrant_collection": collection,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_min_project(
+    root,
+    name: str,
+    *,
+    language_pair: str,
+    source_lang: str,
+    target_lang: str,
+    collection: str,
+) -> None:
+    project_dir = root / name
+    project_dir.mkdir(parents=True)
+    (project_dir / "profile.json").write_text(
+        json.dumps(
+            {
+                "name": name,
+                "language_pair": language_pair,
+                "source_lang": source_lang,
+                "target_lang": target_lang,
+                "game": "Isekai",
+                "qdrant_collection": collection,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_translate_single_happy_path():
     terms = [TermEntry(source="契丹", target="Khitan", category="势力")]
     refs = [RAGSearchResult(source="契丹来犯", target="The Khitan are attacking", score=0.92)]
@@ -160,6 +229,68 @@ def test_translate_single_happy_path():
     assert "术语参考" in user_msg
     assert "Khitan" in user_msg
     assert "契丹来犯" in user_msg
+
+
+def test_translate_single_uses_project_resources_and_collection(tmp_path):
+    projects = tmp_path / "projects"
+    _write_project(
+        projects,
+        "wwm/zh-en",
+        term_source="燕云",
+        term_target="Where Winds Meet",
+        style="WWM style",
+        collection="wwm_corpus",
+    )
+    project_resources = ProjectResourceManager(ProjectRegistry(projects_dir=projects, default_project="wwm/zh-en"))
+    rag = FakeRAG()
+    llm = FakeLLM(response_fn=lambda msgs: "From Where Winds Meet.")
+    pipe = TranslationPipeline(
+        TerminologyService(),
+        rag,
+        StyleGuideService(),
+        llm,
+        project_resources=project_resources,
+    )
+
+    result = asyncio.run(pipe.translate_single("燕云来客", project_id="wwm/zh-en"))
+
+    assert result.status == "success"
+    assert result.terminology_used == [{"source": "燕云", "target": "Where Winds Meet"}]
+    assert rag.collection_calls == ["wwm_corpus"]
+    system_msg = llm.calls[0][0]["content"]
+    assert "WWM style" in system_msg
+
+
+def test_translate_single_project_language_pair_overrides_hardcoded_english(tmp_path):
+    projects = tmp_path / "projects"
+    _write_min_project(
+        projects,
+        "isekai/en-de",
+        language_pair="EN-DE",
+        source_lang="en",
+        target_lang="de",
+        collection="isekai_de_corpus",
+    )
+    project_resources = ProjectResourceManager(ProjectRegistry(projects_dir=projects, default_project="isekai/en-de"))
+    rag = FakeRAG()
+    llm = FakeLLM(response_fn=lambda msgs: "Deutsche Übersetzung.")
+    pipe = TranslationPipeline(
+        TerminologyService(),
+        rag,
+        StyleGuideService(),
+        llm,
+        project_resources=project_resources,
+    )
+
+    result = asyncio.run(pipe.translate_single("Village Elder", project_id="isekai/en-de"))
+
+    assert result.status == "success"
+    system_msg = llm.calls[0][0]["content"]
+    user_msg = llm.calls[0][1]["content"]
+    assert "源语言：English" in system_msg
+    assert "目标语言：German" in system_msg
+    assert "翻译为英文" not in system_msg
+    assert "英文译文" not in user_msg
 
 
 def test_translate_single_no_term_match_skips_term_section():

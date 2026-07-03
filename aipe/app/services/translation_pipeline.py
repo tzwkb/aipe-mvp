@@ -5,7 +5,7 @@
 
 提供两条调用路径：
 - ``translate_single``：单句无状态端到端翻译（默认路径）
-- ``translate_group``：整组并排翻译（结构高度相似的句子用同一英文句式，保证一致性）
+- ``translate_group``：整组并排翻译（结构高度相似的句子用同一目标语句式，保证一致性）
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 
 from app.errors import TranslationError
 from app.schemas.rag import RAGSearchResult
@@ -21,6 +22,7 @@ from app.schemas.terminology import TermEntry
 from app.schemas.translate import TranslationResult
 from app.schemas.web_search import WebSearchResult
 from app.services.llm_service import LLMService
+from app.services.project_service import ProjectProfile, ProjectResourceManager
 from app.services.rag_service import RAGDiagnostics, RAGService
 from app.services.style_guide_service import ContentType, StyleGuideService
 from app.services.terminology_service import TerminologyService
@@ -32,18 +34,18 @@ logger = logging.getLogger(__name__)
 
 
 _BASE_SYSTEM = (
-    "你是一名专业的游戏本地化译者，负责将中文游戏文本翻译为英文。\n"
+    "你是一名专业的游戏本地化译者，负责按项目语言方向翻译游戏文本。\n"
     "请遵守以下要求：\n\n"
     "## 翻译要求\n"
     "1. 术语参考段是高优先级提示，默认应使用其中给出的目标译文，但是可以根据具体情况调整使用合适的字母大小写；仅在语境明显冲突或会导致句子不通顺时才允许调整\n"
     "2. RAG 参考例句反映游戏内同类语境的真实译法，请结合相似度分数与上下文综合参考\n"
-    "3. 保持武侠 / 江湖 / 古风调性，避免现代口语\n"
+    "3. 遵守项目背景、风格指南和文本功能要求，保持目标语自然准确\n"
     "4. 按照下方输出格式要求输出，不要输出格式外的额外内容\n"
     "5. 外部网络参考段（如有）来自公开网络搜索，优先级最低；只用来理解专有名词的背景，与术语 / RAG 冲突时一律以术语 / RAG 为准\n\n"
     "## 富文本与变量标记规则\n"
     "待翻译文本中可能出现以下特殊标记，请按规则处理，确保输出中标记位置正确：\n\n"
     "1. **字体格式标签**（非打印字符）：`#G......#E`、`#C......#E`、`#Y......#E` 等用于定义二者之间的文字格式（如颜色）。\n"
-    "   译文需要保留这些标签，并将对应的英文译文放在标签之间（即 `#G` 与 `#E` 之间）。\n\n"
+    "   译文需要保留这些标签，并将对应的译文放在标签之间（即 `#G` 与 `#E` 之间）。\n\n"
     "2. **通用文本变量**（打印字符）：`{}` 为空占位符，翻译时将其视为实际文本内容的一部分处理，确保位置正确。\n\n"
     "3. **具名文本变量**（打印字符）：如 `{slot1_qishu_name}`、`{kungfu_main_name}` 等。\n"
     "   这些是真实文本的占位符，译文需考虑其实际含义，将其放在语法和语义都恰当的位置。\n\n"
@@ -64,6 +66,39 @@ _WEB_SECTION_HEADER = (
 )
 
 
+_LANGUAGE_NAMES = {
+    "ZH": "Chinese",
+    "ZHCN": "Chinese",
+    "ZH-CN": "Chinese",
+    "CN": "Chinese",
+    "EN": "English",
+    "ENUS": "English",
+    "EN-US": "English",
+    "DE": "German",
+    "DEDE": "German",
+    "DE-DE": "German",
+    "FR": "French",
+    "FRFR": "French",
+    "FR-FR": "French",
+    "JA": "Japanese",
+    "JP": "Japanese",
+    "RU": "Russian",
+    "PT": "Portuguese",
+    "ES": "Spanish",
+}
+
+
+@dataclass(frozen=True)
+class _ProjectContext:
+    profile: ProjectProfile | None
+    terminology_svc: TerminologyService
+    style_guide_svc: StyleGuideService
+    rag_collection: str | None
+    base_system: str
+    web_search_prefix: str | None
+    vision_system_prompt: str | None
+
+
 class TranslationPipeline:
     """翻译流水线。``translate_single`` / ``translate_group`` 都是无状态端到端调用。"""
 
@@ -76,6 +111,7 @@ class TranslationPipeline:
         web_search_svc: WebSearchService | None = None,
         web_search_dense_threshold: float = 0.6,
         vision_svc: VisionService | None = None,
+        project_resources: ProjectResourceManager | None = None,
     ):
         self.terminology_svc = terminology_svc
         self.rag_svc = rag_svc
@@ -85,6 +121,7 @@ class TranslationPipeline:
         self.web_search_svc = web_search_svc
         self.default_web_search_dense_threshold = web_search_dense_threshold
         self.vision_svc = vision_svc
+        self.project_resources = project_resources
 
     # ---------- 单句路径 ----------
 
@@ -100,6 +137,7 @@ class TranslationPipeline:
         enable_web_search: bool = False,
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
+        project_id: str | None = None,
     ) -> TranslationResult:
         """端到端翻译一句。失败时返回 status=error，不抛异常（保证批量不被单句拖垮）。
 
@@ -116,15 +154,18 @@ class TranslationPipeline:
                 error_msg="empty input",
             )
 
+        project_ctx = self._resolve_project(project_id, rag_collection)
+        effective_collection = rag_collection or project_ctx.rag_collection
+
         # Step 0: 文本类型分类（传入时跳过，否则 LLM 预分类）
         if content_type is None:
-            content_type = await self._classify_text(source)
+            content_type = await self._classify_text(source, style_guide_svc=project_ctx.style_guide_svc)
             logger.debug("文本分类: %r… → %s", source[:30], content_type.value)
         else:
             logger.debug("文本分类(复用传入): %r… → %s", source[:30], content_type.value)
 
         # Step 1: 术语命中匹配（仅作为 Prompt 参考段，不修改原文）
-        term_matches = self.terminology_svc.find_matches(source)
+        term_matches = project_ctx.terminology_svc.find_matches(source)
 
         # Step 2: RAG 检索（异常降级为空参考）
         references: list[RAGSearchResult] = []
@@ -136,14 +177,14 @@ class TranslationPipeline:
                         source,
                         threshold=rag_threshold,
                         top_k=rag_top_k,
-                        collection=rag_collection,
+                        collection=effective_collection,
                     )
                 else:
                     references = await self.rag_svc.search(
                         source,
                         threshold=rag_threshold,
                         top_k=rag_top_k,
-                        collection=rag_collection,
+                        collection=effective_collection,
                     )
             except Exception as exc:
                 logger.warning("RAG 检索失败，跳过参考: %s", exc)
@@ -158,11 +199,19 @@ class TranslationPipeline:
             enable_web_search=enable_web_search,
             user_threshold=web_search_dense_threshold,
             enable_vision=enable_vision,
+            web_search_prefix=project_ctx.web_search_prefix,
+            vision_system_prompt=project_ctx.vision_system_prompt,
         )
 
         # Step 3: Prompt 组装
         messages = self._build_messages(
-            source, term_matches, references, content_type, web_refs=web_refs
+            source,
+            term_matches,
+            references,
+            content_type,
+            web_refs=web_refs,
+            style_guide_svc=project_ctx.style_guide_svc,
+            base_system=project_ctx.base_system,
         )
 
         image_analysis = _extract_image_analysis(web_refs)
@@ -213,8 +262,9 @@ class TranslationPipeline:
         enable_web_search: bool = False,
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
+        project_id: str | None = None,
     ) -> list[TranslationResult]:
-        """整组并排翻译。所有句子共享结构模板，要求 LLM 用同一英文句式。
+        """整组并排翻译。所有句子共享结构模板，要求 LLM 用同一目标语句式。
 
         输入 N 句、输出 N 句，顺序与输入对齐。失败（LLM 报错 / 解析失败）时
         自动 fallback 为逐句 ``translate_single``，确保对外语义与单句路径一致。
@@ -238,10 +288,13 @@ class TranslationPipeline:
                     enable_web_search=enable_web_search,
                     web_search_dense_threshold=web_search_dense_threshold,
                     enable_vision=enable_vision,
+                    project_id=project_id,
                 )
             ]
 
         cleaned = [(s or "").strip() for s in sources]
+        project_ctx = self._resolve_project(project_id, rag_collection)
+        effective_collection = rag_collection or project_ctx.rag_collection
         if not all(cleaned):
             # 出现空串时回退单句（translate_single 会对空串返回 error 结果）
             return await self._fallback_singles(
@@ -254,11 +307,12 @@ class TranslationPipeline:
                 enable_web_search=enable_web_search,
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
+                project_id=project_id,
             )
 
         # Step 0: 分类（传入时跳过，否则对代表句预分类）
         if content_type is None:
-            content_type = await self._classify_text(cleaned[0])
+            content_type = await self._classify_text(cleaned[0], style_guide_svc=project_ctx.style_guide_svc)
             logger.debug(
                 "整组分类: size=%d 代表句=%r → %s",
                 len(cleaned),
@@ -274,13 +328,13 @@ class TranslationPipeline:
             )
 
         # Step 1: 术语命中（对每句独立扫描后并集去重，保持出现顺序）
-        term_matches = self._collect_terms(cleaned)
+        term_matches = self._collect_terms(cleaned, terminology_svc=project_ctx.terminology_svc)
 
         # Step 2: RAG（每句并行检索，按 score 合并去重）
         references: list[RAGSearchResult] = []
         if enable_rag:
             references = await self._collect_references(
-                cleaned, threshold=rag_threshold, top_k=rag_top_k, collection=rag_collection
+                cleaned, threshold=rag_threshold, top_k=rag_top_k, collection=effective_collection
             )
 
         # Step 2.5: 整组 Web 搜索兜底（只用代表句触发，整组共享一次结果）
@@ -291,15 +345,24 @@ class TranslationPipeline:
             term_matches=term_matches,
             enable_rag=enable_rag,
             rag_threshold=rag_threshold,
-            rag_collection=rag_collection,
+            rag_collection=effective_collection,
             enable_web_search=enable_web_search,
             user_threshold=web_search_dense_threshold,
             enable_vision=enable_vision,
+            web_search_prefix=project_ctx.web_search_prefix,
+            vision_system_prompt=project_ctx.vision_system_prompt,
         )
 
         # Step 3: 构建整组 prompt
         messages = self._build_group_messages(
-            cleaned, term_matches, references, content_type, template_hint, web_refs=web_refs
+            cleaned,
+            term_matches,
+            references,
+            content_type,
+            template_hint,
+            web_refs=web_refs,
+            style_guide_svc=project_ctx.style_guide_svc,
+            base_system=project_ctx.base_system,
         )
 
         # Step 4: LLM 调用
@@ -316,6 +379,7 @@ class TranslationPipeline:
                 enable_web_search=enable_web_search,
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
+                project_id=project_id,
             )
 
         # Step 5: 解析编号输出
@@ -335,6 +399,7 @@ class TranslationPipeline:
                 enable_web_search=enable_web_search,
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
+                project_id=project_id,
             )
 
         term_view = self._term_used_view(term_matches)
@@ -375,6 +440,7 @@ class TranslationPipeline:
         enable_web_search: bool = False,
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
+        project_id: str | None = None,
     ) -> list[TranslationResult]:
         """整段对话翻译。``sources`` 已按对话发生顺序排列，``speakers`` 与之等长。
 
@@ -407,10 +473,13 @@ class TranslationPipeline:
                     enable_web_search=enable_web_search,
                     web_search_dense_threshold=web_search_dense_threshold,
                     enable_vision=enable_vision,
+                    project_id=project_id,
                 )
             ]
 
         cleaned = [(s or "").strip() for s in sources]
+        project_ctx = self._resolve_project(project_id, rag_collection)
+        effective_collection = rag_collection or project_ctx.rag_collection
         if not all(cleaned):
             # 出现空句时退化为单句路径，translate_single 会对空串返回 error
             return await self._fallback_singles(
@@ -423,20 +492,21 @@ class TranslationPipeline:
                 enable_web_search=enable_web_search,
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
+                project_id=project_id,
             )
 
         # Step 0: 分类（传入时跳过；否则对代表句预分类）
         if content_type is None:
-            content_type = await self._classify_text(cleaned[0])
+            content_type = await self._classify_text(cleaned[0], style_guide_svc=project_ctx.style_guide_svc)
 
         # Step 1: 术语命中并集
-        term_matches = self._collect_terms(cleaned)
+        term_matches = self._collect_terms(cleaned, terminology_svc=project_ctx.terminology_svc)
 
         # Step 2: RAG
         references: list[RAGSearchResult] = []
         if enable_rag:
             references = await self._collect_references(
-                cleaned, threshold=rag_threshold, top_k=rag_top_k, collection=rag_collection
+                cleaned, threshold=rag_threshold, top_k=rag_top_k, collection=effective_collection
             )
 
         # Step 2.5: 对话 Web 搜索兜底（用首句作代表句，整段共享）
@@ -446,16 +516,20 @@ class TranslationPipeline:
             term_matches=term_matches,
             enable_rag=enable_rag,
             rag_threshold=rag_threshold,
-            rag_collection=rag_collection,
+            rag_collection=effective_collection,
             enable_web_search=enable_web_search,
             user_threshold=web_search_dense_threshold,
             enable_vision=enable_vision,
+            web_search_prefix=project_ctx.web_search_prefix,
+            vision_system_prompt=project_ctx.vision_system_prompt,
         )
 
         # Step 3: 对话 prompt（times 仅用于排序，不进 prompt）
         messages = self._build_dialog_messages(
             cleaned, speakers, term_matches, references, content_type, dialog_id,
             web_refs=web_refs,
+            style_guide_svc=project_ctx.style_guide_svc,
+            base_system=project_ctx.base_system,
         )
 
         term_view = self._term_used_view(term_matches)
@@ -561,8 +635,11 @@ class TranslationPipeline:
         dialog_id: str | None,
         *,
         web_refs: list[WebSearchResult] | None = None,
+        style_guide_svc: StyleGuideService | None = None,
+        base_system: str | None = None,
     ) -> list[dict[str, str]]:
-        system = self.style_guide_svc.build_system_prompt_for_type(_BASE_SYSTEM, content_type)
+        sg = style_guide_svc or self.style_guide_svc
+        system = sg.build_system_prompt_for_type(base_system or _BASE_SYSTEM, content_type)
 
         header_bits = [f"以下是一段游戏内连续对话，共 {len(sources)} 句，按对话发生顺序列出。"]
         if dialog_id:
@@ -570,9 +647,9 @@ class TranslationPipeline:
         header_bits.extend(
             [
                 "请结合上下文（说话人身份、上下句衔接、语气、信息流向）翻译每一句，",
-                "确保整段译文在英文中读起来像一段连贯、自然的对话。",
+                "确保整段译文在目标语中读起来像一段连贯、自然的对话。",
                 "说话人姓名仅供你理解语境使用，**不要**在译文里输出说话人名字，",
-                "也无需保持说话人英文名跨条一致。",
+                "也无需输出说话人姓名。",
             ]
         )
 
@@ -599,7 +676,7 @@ class TranslationPipeline:
 
         parts.append(
             "## 输出格式（严格遵守）\n"
-            '逐行输出，每行格式为 `序号. {"translation": "英文译文", "reason": "简述理由（中文，1句话）"}`，'
+            '逐行输出，每行格式为 `序号. {"translation": "目标语译文", "reason": "简述理由（中文，1句话）"}`，'
             "序号与对话编号严格对应，"
             f"共 {len(sources)} 行。不要重复输出说话人姓名，不要输出原文，"
             "不要加任何解释、标题或 Markdown。"
@@ -613,7 +690,38 @@ class TranslationPipeline:
 
     # ---------- helpers ----------
 
-    async def _classify_text(self, source: str, hint: str | None = None) -> ContentType:
+    def _resolve_project(self, project_id: str | None, rag_collection: str | None) -> _ProjectContext:
+        if project_id and self.project_resources is not None:
+            profile = self.project_resources.profile(project_id)
+            prompt_notes = self.project_resources.prompt_notes(project_id)
+            return _ProjectContext(
+                profile=profile,
+                terminology_svc=self.project_resources.terminology(project_id),
+                style_guide_svc=self.project_resources.style_guide(project_id),
+                rag_collection=rag_collection or profile.qdrant_collection,
+                base_system=_base_system_for_project(profile, prompt_notes),
+                web_search_prefix=profile.web_search_prefix,
+                vision_system_prompt=profile.vision_system_prompt,
+            )
+        if project_id and self.project_resources is None:
+            logger.warning("收到 project_id=%s，但未配置 ProjectResourceManager，使用旧全局状态", project_id)
+        return _ProjectContext(
+            profile=None,
+            terminology_svc=self.terminology_svc,
+            style_guide_svc=self.style_guide_svc,
+            rag_collection=rag_collection,
+            base_system=_BASE_SYSTEM,
+            web_search_prefix=None,
+            vision_system_prompt=None,
+        )
+
+    async def _classify_text(
+        self,
+        source: str,
+        hint: str | None = None,
+        *,
+        style_guide_svc: StyleGuideService | None = None,
+    ) -> ContentType:
         """对文本进行类型分类；失败时静默降级为 UNKNOWN。
 
         ``hint`` 传入时先尝试直接匹配为 ContentType，匹配成功则跳过 LLM 调用。
@@ -629,9 +737,10 @@ class TranslationPipeline:
                 if ct != ContentType.UNKNOWN and ct.value in hint_norm:
                     return ct
 
-        if not self.style_guide_svc.loaded:
+        sg = style_guide_svc or self.style_guide_svc
+        if not sg.loaded:
             return ContentType.UNKNOWN
-        messages = self.style_guide_svc.build_classification_messages(source)
+        messages = sg.build_classification_messages(source)
         raw = await self.llm_svc.classify(messages)
         if raw in {ct.value for ct in ContentType}:
             return ContentType(raw)
@@ -642,12 +751,18 @@ class TranslationPipeline:
         logger.debug("分类结果 %r 不匹配已知类型，退化为 UNKNOWN", raw)
         return ContentType.UNKNOWN
 
-    def _collect_terms(self, sources: list[str]) -> list[TermEntry]:
+    def _collect_terms(
+        self,
+        sources: list[str],
+        *,
+        terminology_svc: TerminologyService | None = None,
+    ) -> list[TermEntry]:
         """对一组句子取术语命中并集，按首次出现顺序去重。"""
         seen: set[str] = set()
         out: list[TermEntry] = []
+        terms = terminology_svc or self.terminology_svc
         for s in sources:
-            for entry in self.terminology_svc.find_matches(s):
+            for entry in terms.find_matches(s):
                 if entry.source in seen:
                     continue
                 seen.add(entry.source)
@@ -706,6 +821,7 @@ class TranslationPipeline:
         enable_web_search: bool = False,
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
+        project_id: str | None = None,
     ) -> list[TranslationResult]:
         out: list[TranslationResult] = []
         for src in sources:
@@ -720,6 +836,7 @@ class TranslationPipeline:
                     enable_web_search=enable_web_search,
                     web_search_dense_threshold=web_search_dense_threshold,
                     enable_vision=enable_vision,
+                    project_id=project_id,
                 )
             )
         return out
@@ -742,10 +859,14 @@ class TranslationPipeline:
         sparse_hits: int,
         dense_threshold: float,
     ) -> bool:
-        """仅判断 dense top1 < 阈值。
+        """术语未命中、sparse 未命中、且 dense top1 < 阈值时才触发。
 
         ``dense_top1 is None`` 视为 0（无召回，触发）。
         """
+        if term_count > 0:
+            return False
+        if sparse_hits > 0:
+            return False
         score = dense_top1 if dense_top1 is not None else 0.0
         return score < dense_threshold
 
@@ -758,6 +879,8 @@ class TranslationPipeline:
         enable_web_search: bool,
         user_threshold: float | None,
         enable_vision: bool = True,
+        web_search_prefix: str | None = None,
+        vision_system_prompt: str | None = None,
     ) -> tuple[list[WebSearchResult], bool]:
         """单句路径用：判定 + 调用 Web 搜索。返回 (refs, triggered)。
 
@@ -780,7 +903,7 @@ class TranslationPipeline:
             diag.sparse_hits,
         )
         try:
-            refs = await self.web_search_svc.search(query)  # type: ignore[union-attr]
+            refs = await self.web_search_svc.search(query, prefix=web_search_prefix)  # type: ignore[union-attr]
         except Exception as exc:  # WebSearchService 已经静默降级，这里只是双保险
             logger.warning("web search 异常，降级为空参考: %s", exc)
             refs = []
@@ -789,7 +912,10 @@ class TranslationPipeline:
         if enable_vision and refs and self.vision_svc:
             first = refs[0]
             if first.image_url and first.image_analysis is None:
-                analysis = await self.vision_svc.analyze_image(first.image_url)
+                analysis = await self.vision_svc.analyze_image(
+                    first.image_url,
+                    system_prompt=vision_system_prompt,
+                )
                 if analysis:
                     refs[0] = first.model_copy(update={"image_analysis": analysis})
 
@@ -807,6 +933,8 @@ class TranslationPipeline:
         enable_web_search: bool,
         user_threshold: float | None,
         enable_vision: bool = True,
+        web_search_prefix: str | None = None,
+        vision_system_prompt: str | None = None,
     ) -> tuple[list[WebSearchResult], bool]:
         """整组/对话路径用：只对代表句发一次诊断查询并触发 Web 搜索。
 
@@ -838,6 +966,8 @@ class TranslationPipeline:
             enable_web_search=enable_web_search,
             user_threshold=user_threshold,
             enable_vision=enable_vision,
+            web_search_prefix=web_search_prefix,
+            vision_system_prompt=vision_system_prompt,
         )
 
     def _build_messages(
@@ -848,8 +978,11 @@ class TranslationPipeline:
         content_type: ContentType,
         *,
         web_refs: list[WebSearchResult] | None = None,
+        style_guide_svc: StyleGuideService | None = None,
+        base_system: str | None = None,
     ) -> list[dict[str, str]]:
-        system = self.style_guide_svc.build_system_prompt_for_type(_BASE_SYSTEM, content_type)
+        sg = style_guide_svc or self.style_guide_svc
+        system = sg.build_system_prompt_for_type(base_system or _BASE_SYSTEM, content_type)
 
         parts: list[str] = []
         if term_matches:
@@ -872,7 +1005,7 @@ class TranslationPipeline:
         parts.append(source)
         parts.append(
             "\n请以 JSON 格式输出（仅输出 JSON，不含任何其他文字或 markdown）：\n"
-            '{"translation": "英文译文", "reason": "用中文简述翻译理由，说明采用了哪些术语/RAG例句/网络资料，'
+            '{"translation": "目标语译文", "reason": "用中文简述翻译理由，说明采用了哪些术语/RAG例句/网络资料，'
             '或关键语境判断（1-2句话）"}'
         )
 
@@ -891,11 +1024,14 @@ class TranslationPipeline:
         template_hint: str,
         *,
         web_refs: list[WebSearchResult] | None = None,
+        style_guide_svc: StyleGuideService | None = None,
+        base_system: str | None = None,
     ) -> list[dict[str, str]]:
-        system = self.style_guide_svc.build_system_prompt_for_type(_BASE_SYSTEM, content_type)
+        sg = style_guide_svc or self.style_guide_svc
+        system = sg.build_system_prompt_for_type(base_system or _BASE_SYSTEM, content_type)
 
         intro_lines = [
-            f"以下 {len(sources)} 句中文源文本结构高度一致，请使用**完全一致的英文句式**翻译。",
+            f"以下 {len(sources)} 句源文本结构高度一致，请使用**完全一致的目标语句式**翻译。",
             "仅替换变量部分；句式骨架（前后缀、连接词、标点风格、大小写）必须 1:1 对应，"
             "确保整组译文模板严格统一。",
         ]
@@ -925,7 +1061,7 @@ class TranslationPipeline:
 
         parts.append(
             "## 输出格式（严格遵守）\n"
-            '逐行输出，每行格式为 `序号. {"translation": "英文译文", "reason": "简述理由（中文，1句话）"}`，'
+            '逐行输出，每行格式为 `序号. {"translation": "目标语译文", "reason": "简述理由（中文，1句话）"}`，'
             "序号与源文本编号严格对应，"
             f"共 {len(sources)} 行。不要输出任何额外解释、标题或 Markdown。"
         )
@@ -1130,6 +1266,42 @@ def _extract_image_analysis(web_refs: list[WebSearchResult] | None) -> str | Non
         if r.image_analysis:
             return r.image_analysis
     return None
+
+
+def _base_system_for_project(profile: ProjectProfile, prompt_notes: str = "") -> str:
+    parts = [_BASE_SYSTEM.rstrip()]
+    project_lines: list[str] = []
+    if profile.game:
+        project_lines.append(f"项目：{profile.game}")
+    if profile.language_pair:
+        project_lines.append(f"语言方向：{profile.language_pair}")
+    source_lang = _language_name(profile.source_lang) if profile.source_lang else None
+    target_lang = _language_name(profile.target_lang) if profile.target_lang else None
+    if (not source_lang or not target_lang) and profile.language_pair:
+        source_lang, target_lang = _language_pair_names(profile.language_pair)
+    if source_lang and target_lang:
+        project_lines.append(f"源语言：{source_lang}")
+        project_lines.append(f"目标语言：{target_lang}")
+        project_lines.append(f"请将源语言文本翻译为{target_lang}。")
+    if profile.background:
+        project_lines.append(f"背景与语气：{profile.background}")
+    if project_lines:
+        parts.append("## 项目背景\n" + "\n".join(project_lines))
+    if prompt_notes:
+        parts.append("## 项目补充提示\n" + prompt_notes)
+    return "\n\n".join(parts)
+
+
+def _language_pair_names(language_pair: str) -> tuple[str | None, str | None]:
+    parts = [p for p in re.split(r"[-_>/→]+", language_pair.strip()) if p]
+    if len(parts) < 2:
+        return None, None
+    return _language_name(parts[0]), _language_name(parts[-1])
+
+
+def _language_name(code: str) -> str:
+    normalized = re.sub(r"[^A-Za-z-]", "", code).upper()
+    return _LANGUAGE_NAMES.get(normalized, code.strip())
 
 
 __all__ = ["TranslationPipeline"]
