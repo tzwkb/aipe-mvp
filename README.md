@@ -20,10 +20,6 @@ English | [中文](README_ZH.md)
 
  Configure the service, vector store, and project resources as described below, then start FastAPI.
 
-## Status
-
- This repository is maintained or used according to the current README notes.
-
 ## Notes
 
  Repository facts follow the service structure and configuration details below.
@@ -53,7 +49,3 @@ cp aipe/.env.example aipe/.env   # add LLM / embedding API key and Qdrant URL
 cd aipe
 docker compose up -d
 ```
-
-## Detailed Technical Notes
-
-This README keeps the English version of the core documentation. Code blocks, paths, commands, and file-layout examples are kept literal so they can be copied and checked against the repository.
