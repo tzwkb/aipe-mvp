@@ -1,6 +1,6 @@
 # aipe-mvp
 
-[中文](README_ZH.md) | English
+English | [中文](README_ZH.md)
 
 
 ## Overview
@@ -27,26 +27,26 @@
 
 ## Command and Configuration Reference
 
-The following code blocks are preserved from the primary README. Commands, paths, and configuration keys are not translated; adjust them for the actual environment.
+The following code blocks keep commands, paths, filenames, and configuration keys literal; explanatory comments are translated for the English README.
 
 ```
 aipe/
 ├── app/
-│   ├── api/          # FastAPI 路由：translate / rag / terminology / style_guide
-│   ├── services/     # 翻译流水线、LLM、RAG、术语、风格、Web 搜索、视觉
-│   ├── schemas/      # Pydantic 模型
-│   ├── utils/        # 文件解析、聚类、进度、文本处理
-│   ├── config.py     # pydantic-settings 配置（全部走环境变量）
+│   ├── api/          # FastAPI routes: translate / rag / terminology / style_guide
+│   ├── services/     # translation pipeline, LLM, RAG, terminology, style guides, web search, vision
+│   ├── schemas/      # Pydantic models
+│   ├── utils/        # file parsing, clustering, progress tracking, text processing
+│   ├── config.py     # pydantic-settings config (all via environment variables)
 │   └── main.py
-├── scripts/          # 语料入库、批量翻译
+├── scripts/          # corpus ingestion and batch translation
 ├── tests/            # pytest
 ├── Dockerfile
 └── docker-compose.yml
-scripts/              # 语料清洗 / Qdrant 入库 / 文件检查
+scripts/              # corpus cleaning / Qdrant ingestion / file checks
 ```
 
 ```bash
-cp aipe/.env.example aipe/.env   # 填入 LLM / Embedding API key、Qdrant 地址
+cp aipe/.env.example aipe/.env   # add LLM / embedding API key and Qdrant URL
 cd aipe
 docker compose up -d
 ```
