@@ -1,21 +1,33 @@
 # aipe-mvp
 
-中文 | [English](README_EN.md)
+[中文](README_ZH.md) | English
 
 
-《燕云十六声》中译英游戏本地化 AI 翻译服务。FastAPI + Qdrant 向量检索 + LLM，带术语库、风格指南、RAG 召回和 Web 搜索兜底。
+## Overview
 
-## 能力
+ ZH-to-EN game-localization translation service for Where Winds Meet, built with FastAPI, Qdrant, terminology, style guides, and RAG retrieval.
 
-- 翻译流水线：术语注入 → RAG 召回相似译例 → 风格指南约束 → LLM 生成
-- 术语管理：精确/模糊匹配查询、批量导入
-- 向量检索：Qdrant dense(text-embedding-3-large 1024 维) + sparse(jieba 词频) 混合召回
-- 风格指南：检索匹配、按场景注入
-- Web 搜索兜底：RAG 弱召回或术语未命中时调博查搜索补充上下文
-- 视觉分析：从配图提取对汉译英有帮助的信息
-- 批量处理：异步并发 + 断点续传
+## Key Capabilities
 
-## 结构
+- Provides an API-based translation service.
+- Uses vector retrieval for translation memory and reference corpora.
+- Combines terminology, style guides, and web-search fallback.
+
+## Usage
+
+ Configure the service, vector store, and project resources as described below, then start FastAPI.
+
+## Status
+
+ This repository is maintained or used according to the current README notes.
+
+## Notes
+
+ Repository facts follow the service structure and configuration details below.
+
+## Command and Configuration Reference
+
+The following code blocks are preserved from the primary README. Commands, paths, and configuration keys are not translated; adjust them for the actual environment.
 
 ```
 aipe/
@@ -33,21 +45,12 @@ aipe/
 scripts/              # 语料清洗 / Qdrant 入库 / 文件检查
 ```
 
-## 运行
-
-需 Docker + Docker Compose。
-
 ```bash
 cp aipe/.env.example aipe/.env   # 填入 LLM / Embedding API key、Qdrant 地址
 cd aipe
 docker compose up -d
 ```
 
-启动后访问 `http://localhost:8000/docs` 看交互式 API 文档；接口说明见 `aipe/API.md`，更多见 `aipe/QUICKSTART.md`。
+## Detailed Technical Notes
 
-## 数据与密钥
-
-仓库**只含代码**。以下不在仓库内，需自备：
-
-- 语料、术语库、风格指南、向量快照（`*.snapshot` / `corpus/` / `aipe/data/`）—— 体积大且属客户机密
-- `.env` 里的 LLM / Embedding / 博查 API key —— 照 `aipe/.env.example` 自行填写
+The primary README keeps the original technical details, history notes, full commands, and file layout. This file maintains the English version of the core documentation; consult the primary README code blocks and paths when exact commands are needed.
