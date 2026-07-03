@@ -1,6 +1,6 @@
 # aipe-mvp
 
-中文 | [English](README.md)
+[English](README.md) | 中文
 
 
 《燕云十六声》中译英游戏本地化 AI 翻译服务。FastAPI + Qdrant 向量检索 + LLM，带术语库、风格指南、RAG 召回和 Web 搜索兜底。
