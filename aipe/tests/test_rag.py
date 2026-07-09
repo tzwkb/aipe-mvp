@@ -104,6 +104,25 @@ def test_index_and_exact_hit(rag_svc: RAGService):
     assert hits[0].score > 0.0
 
 
+def test_find_exact_source_matches_prefers_higher_status_without_embedding(rag_svc: RAGService):
+    entries = [
+        CorpusEntry(source="同源", target="Done target", status="Done"),
+        CorpusEntry(source="同源", target="Designer target", status="Designer Reviewed"),
+        CorpusEntry(source="近似同源", target="Near target", status="Designer Reviewed"),
+    ]
+    asyncio.run(rag_svc.index(entries))
+    fake_llm: _DeterministicEmbedLLM = rag_svc.llm_svc  # type: ignore[assignment]
+    before_calls = fake_llm.calls
+
+    hits = asyncio.run(rag_svc.find_exact_source_matches("同源", top_k=3))
+
+    assert [h.target for h in hits] == ["Designer target", "Done target"]
+    assert all(h.source == "同源" and h.score == 1.0 for h in hits)
+    assert hits[0].status == "Designer Reviewed"
+    assert fake_llm.calls == before_calls
+    assert asyncio.run(rag_svc.find_exact_source_matches("不存在")) == []
+
+
 def test_below_threshold_returns_empty(rag_svc: RAGService):
     asyncio.run(
         rag_svc.index([CorpusEntry(source="契丹来犯", target="The Khitan attack")])

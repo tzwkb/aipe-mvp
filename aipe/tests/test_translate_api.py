@@ -31,6 +31,7 @@ class FakePipeline:
         web_search_dense_threshold=None,
         enable_vision=True,
         project_id=None,
+        use_tm_exact_match=False,
     ):
         if not text or not text.strip():
             return TranslationResult(source=text, translation="", status="error", error_msg="empty")
@@ -112,7 +113,12 @@ def test_translate_file_txt_and_csv_export(tmp_path):
             assert "text/csv" in r3.headers["content-type"]
             body = r3.content.decode("utf-8-sig")
             lines = [l for l in body.splitlines() if l]
-            assert lines[0] == "source,translation,translation_reason,status,content_type,terminology_used,rag_references,web_references,web_search_triggered,image_analysis,error_msg"
+            assert lines[0] == (
+                "source,translation,translation_reason,status,content_type,terminology_used,"
+                "rag_references,tm_exact_match_used,tm_exact_match_source,tm_exact_match_target,"
+                "tm_exact_match_status,tm_exact_match_score,web_references,web_search_triggered,"
+                "image_analysis,error_msg"
+            )
             assert any("世界" in l and "世界".upper() in l for l in lines[1:])
     finally:
         _clear_overrides()

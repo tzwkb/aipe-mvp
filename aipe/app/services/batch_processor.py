@@ -85,6 +85,7 @@ class BatchProcessor:
         enable_web_search: bool = False,
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
+        use_tm_exact_match: bool = False,
     ) -> BatchTranslateResponse:
         """执行批量翻译。返回包含全部已完成结果的响应（按原始顺序）。
 
@@ -188,6 +189,7 @@ class BatchProcessor:
                 "enable_web_search": bool(enable_web_search),
                 "web_search_dense_threshold": web_search_dense_threshold,
                 "enable_vision": bool(enable_vision),
+                "use_tm_exact_match": bool(use_tm_exact_match),
                 "dialog_mode": bool(dialog_mode),
                 "enable_cluster": effective_cluster,
             },
@@ -219,6 +221,7 @@ class BatchProcessor:
                         web_search_dense_threshold=web_search_dense_threshold,
                         enable_vision=enable_vision,
                         project_id=effective_project_id,
+                        use_tm_exact_match=use_tm_exact_match,
                     )
                 elif unit.kind == "dialog":
                     dialog_ct = next((ct for ct in unit_cts if ct), None)
@@ -236,6 +239,7 @@ class BatchProcessor:
                         web_search_dense_threshold=web_search_dense_threshold,
                         enable_vision=enable_vision,
                         project_id=effective_project_id,
+                        use_tm_exact_match=use_tm_exact_match,
                     )
                 else:
                     results = await self._run_singles(
@@ -249,6 +253,7 @@ class BatchProcessor:
                         web_search_dense_threshold=web_search_dense_threshold,
                         enable_vision=enable_vision,
                         project_id=effective_project_id,
+                        use_tm_exact_match=use_tm_exact_match,
                     )
                 await tracker.save_batch(
                     idx, [r.model_dump(mode="json") for r in results]
@@ -422,6 +427,7 @@ class BatchProcessor:
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
         project_id: str | None = None,
+        use_tm_exact_match: bool = False,
     ) -> list[TranslationResult]:
         from app.services.style_guide_service import ContentType
 
@@ -449,6 +455,7 @@ class BatchProcessor:
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
                 project_id=project_id,
+                use_tm_exact_match=use_tm_exact_match,
             )
         except Exception as exc:  # 兜底：理论上 translate_group 不抛
             logger.exception("translate_group 兜底捕获: %s", exc)
@@ -478,6 +485,7 @@ class BatchProcessor:
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
         project_id: str | None = None,
+        use_tm_exact_match: bool = False,
     ) -> list[TranslationResult]:
         from app.services.style_guide_service import ContentType
 
@@ -507,6 +515,7 @@ class BatchProcessor:
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
                 project_id=project_id,
+                use_tm_exact_match=use_tm_exact_match,
             )
         except Exception as exc:  # 兜底：理论上 translate_dialog 不抛
             logger.exception(
@@ -535,6 +544,7 @@ class BatchProcessor:
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
         project_id: str | None = None,
+        use_tm_exact_match: bool = False,
     ) -> list[TranslationResult]:
         from app.services.style_guide_service import ContentType
 
@@ -564,6 +574,7 @@ class BatchProcessor:
                     web_search_dense_threshold=web_search_dense_threshold,
                     enable_vision=enable_vision,
                     project_id=project_id,
+                    use_tm_exact_match=use_tm_exact_match,
                 )
             except Exception as exc:  # 兜底：理论上 translate_single 不抛
                 logger.exception("translate_single 兜底捕获: %s", exc)

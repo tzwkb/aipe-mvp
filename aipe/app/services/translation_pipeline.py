@@ -37,7 +37,7 @@ _BASE_SYSTEM = (
     "你是一名专业的游戏本地化译者，负责按项目语言方向翻译游戏文本。\n"
     "请遵守以下要求：\n\n"
     "## 翻译要求\n"
-    "1. 术语参考段是高优先级提示，默认应使用其中给出的目标译文，但是可以根据具体情况调整使用合适的字母大小写；仅在语境明显冲突或会导致句子不通顺时才允许调整\n"
+    "1. 术语参考段按文本功能使用：UI、任务、道具、技能、系统规则等功能性文本优先保持术语一致；剧情、口语、邮件、外观描述等叙事性文本应结合语境取舍，不要把术语表当作逐字替换表\n"
     "2. RAG 参考例句反映游戏内同类语境的真实译法，请结合相似度分数与上下文综合参考\n"
     "3. 遵守项目背景、风格指南和文本功能要求，保持目标语自然准确\n"
     "4. 按照下方输出格式要求输出，不要输出格式外的额外内容\n"
@@ -86,6 +86,33 @@ _LANGUAGE_NAMES = {
     "PT": "Portuguese",
     "ES": "Spanish",
 }
+
+
+_FUNCTIONAL_TERM_TYPES = {
+    ContentType.UI,
+    ContentType.QUEST,
+    ContentType.QUEST_OBJECTIVE,
+    ContentType.QUEST_DESCRIPTION,
+    ContentType.ACHIEVEMENT,
+    ContentType.SKILL,
+    ContentType.HINT,
+    ContentType.NOTIFICATION,
+    ContentType.ITEM,
+    ContentType.ENTITY,
+    ContentType.PRESCRIPTION,
+}
+
+_CONTEXTUAL_TERM_TYPES = {
+    ContentType.STORY,
+    ContentType.SPEECH,
+    ContentType.MARTIAL_RECORDS,
+    ContentType.APPEARANCE_DESCRIPTION,
+    ContentType.BESTIARY,
+}
+
+_TERM_SECTION_TITLE = (
+    "## 术语参考（按文本功能使用；功能/UI/道具/任务类保持一致，口语/剧情/邮件类按语境取舍）"
+)
 
 
 @dataclass(frozen=True)
@@ -138,6 +165,7 @@ class TranslationPipeline:
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
         project_id: str | None = None,
+        use_tm_exact_match: bool = False,
     ) -> TranslationResult:
         """端到端翻译一句。失败时返回 status=error，不抛异常（保证批量不被单句拖垮）。
 
@@ -156,6 +184,15 @@ class TranslationPipeline:
 
         project_ctx = self._resolve_project(project_id, rag_collection)
         effective_collection = rag_collection or project_ctx.rag_collection
+
+        if use_tm_exact_match:
+            direct = await self._maybe_tm_exact_result(
+                source,
+                collection=effective_collection,
+                content_type=content_type,
+            )
+            if direct is not None:
+                return direct
 
         # Step 0: 文本类型分类（传入时跳过，否则 LLM 预分类）
         if content_type is None:
@@ -263,6 +300,7 @@ class TranslationPipeline:
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
         project_id: str | None = None,
+        use_tm_exact_match: bool = False,
     ) -> list[TranslationResult]:
         """整组并排翻译。所有句子共享结构模板，要求 LLM 用同一目标语句式。
 
@@ -289,6 +327,7 @@ class TranslationPipeline:
                     web_search_dense_threshold=web_search_dense_threshold,
                     enable_vision=enable_vision,
                     project_id=project_id,
+                    use_tm_exact_match=use_tm_exact_match,
                 )
             ]
 
@@ -308,7 +347,33 @@ class TranslationPipeline:
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
                 project_id=project_id,
+                use_tm_exact_match=use_tm_exact_match,
             )
+
+        if use_tm_exact_match:
+            direct_results = await self._collect_tm_exact_results(
+                cleaned,
+                collection=effective_collection,
+                content_type=content_type,
+            )
+            if any(r is not None for r in direct_results):
+                if all(r is not None for r in direct_results):
+                    return [r for r in direct_results if r is not None]
+                unmatched_indices = [i for i, r in enumerate(direct_results) if r is None]
+                translated_unmatched = await self.translate_group(
+                    [cleaned[i] for i in unmatched_indices],
+                    enable_rag=enable_rag,
+                    rag_threshold=rag_threshold,
+                    rag_top_k=rag_top_k,
+                    content_type=content_type,
+                    rag_collection=rag_collection,
+                    enable_web_search=enable_web_search,
+                    web_search_dense_threshold=web_search_dense_threshold,
+                    enable_vision=enable_vision,
+                    project_id=project_id,
+                    use_tm_exact_match=False,
+                )
+                return _merge_direct_results(direct_results, translated_unmatched)
 
         # Step 0: 分类（传入时跳过，否则对代表句预分类）
         if content_type is None:
@@ -441,6 +506,7 @@ class TranslationPipeline:
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
         project_id: str | None = None,
+        use_tm_exact_match: bool = False,
     ) -> list[TranslationResult]:
         """整段对话翻译。``sources`` 已按对话发生顺序排列，``speakers`` 与之等长。
 
@@ -474,6 +540,7 @@ class TranslationPipeline:
                     web_search_dense_threshold=web_search_dense_threshold,
                     enable_vision=enable_vision,
                     project_id=project_id,
+                    use_tm_exact_match=use_tm_exact_match,
                 )
             ]
 
@@ -493,7 +560,36 @@ class TranslationPipeline:
                 web_search_dense_threshold=web_search_dense_threshold,
                 enable_vision=enable_vision,
                 project_id=project_id,
+                use_tm_exact_match=use_tm_exact_match,
             )
+
+        if use_tm_exact_match:
+            direct_results = await self._collect_tm_exact_results(
+                cleaned,
+                collection=effective_collection,
+                content_type=content_type,
+            )
+            if any(r is not None for r in direct_results):
+                if all(r is not None for r in direct_results):
+                    return [r for r in direct_results if r is not None]
+                unmatched_indices = [i for i, r in enumerate(direct_results) if r is None]
+                translated_unmatched = await self.translate_dialog(
+                    [cleaned[i] for i in unmatched_indices],
+                    [speakers[i] for i in unmatched_indices],
+                    dialog_id=dialog_id,
+                    times=[times[i] for i in unmatched_indices] if times is not None else None,
+                    enable_rag=enable_rag,
+                    rag_threshold=rag_threshold,
+                    rag_top_k=rag_top_k,
+                    content_type=content_type,
+                    rag_collection=rag_collection,
+                    enable_web_search=enable_web_search,
+                    web_search_dense_threshold=web_search_dense_threshold,
+                    enable_vision=enable_vision,
+                    project_id=project_id,
+                    use_tm_exact_match=False,
+                )
+                return _merge_direct_results(direct_results, translated_unmatched)
 
         # Step 0: 分类（传入时跳过；否则对代表句预分类）
         if content_type is None:
@@ -656,9 +752,7 @@ class TranslationPipeline:
         parts: list[str] = ["## 对话翻译任务", "\n".join(header_bits)]
 
         if term_matches:
-            parts.append(
-                "## 术语参考（强烈推荐使用以下目标译文，除非语境明显冲突）"
-            )
+            parts.append(_TERM_SECTION_TITLE)
             parts.append(_format_term_section(term_matches))
 
         if references:
@@ -670,6 +764,8 @@ class TranslationPipeline:
         if web_refs:
             parts.append(_WEB_SECTION_HEADER)
             parts.append(_format_web_section(web_refs))
+
+        parts.append(_format_feedback_rules(content_type))
 
         parts.append("## 对话内容")
         parts.append(_format_dialog_lines(sources, speakers))
@@ -809,6 +905,61 @@ class TranslationPipeline:
         cap = max(per_query_k, per_query_k * 2)
         return merged[:cap]
 
+    async def _maybe_tm_exact_result(
+        self,
+        source: str,
+        *,
+        collection: str | None,
+        content_type: ContentType | None,
+    ) -> TranslationResult | None:
+        try:
+            matches = await self.rag_svc.find_exact_source_matches(
+                source,
+                collection=collection,
+                top_k=1,
+            )
+        except Exception as exc:
+            logger.warning("TM 精确匹配查询失败，降级为常规翻译: %s", exc)
+            return None
+        if not matches:
+            return None
+
+        match = matches[0]
+        return TranslationResult(
+            source=source,
+            translation=match.target,
+            translation_reason=(
+                "TM_EXACT_MATCH: source 与 TM 语料完全一致，直接采用最高优先级 TM target，跳过 AI 翻译。"
+            ),
+            status="success",
+            content_type=content_type.value if content_type is not None else None,
+            rag_references=self._refs_view(matches),
+            tm_exact_match_used=True,
+            tm_exact_match_source=match.source,
+            tm_exact_match_target=match.target,
+            tm_exact_match_status=match.status,
+            tm_exact_match_score=match.score,
+        )
+
+    async def _collect_tm_exact_results(
+        self,
+        sources: list[str],
+        *,
+        collection: str | None,
+        content_type: ContentType | None,
+    ) -> list[TranslationResult | None]:
+        results = await asyncio.gather(
+            *(
+                self._maybe_tm_exact_result(
+                    src,
+                    collection=collection,
+                    content_type=content_type,
+                )
+                for src in sources
+            )
+        )
+        return list(results)
+
     async def _fallback_singles(
         self,
         sources: list[str],
@@ -822,6 +973,7 @@ class TranslationPipeline:
         web_search_dense_threshold: float | None = None,
         enable_vision: bool = True,
         project_id: str | None = None,
+        use_tm_exact_match: bool = False,
     ) -> list[TranslationResult]:
         out: list[TranslationResult] = []
         for src in sources:
@@ -837,6 +989,7 @@ class TranslationPipeline:
                     web_search_dense_threshold=web_search_dense_threshold,
                     enable_vision=enable_vision,
                     project_id=project_id,
+                    use_tm_exact_match=use_tm_exact_match,
                 )
             )
         return out
@@ -986,9 +1139,7 @@ class TranslationPipeline:
 
         parts: list[str] = []
         if term_matches:
-            parts.append(
-                "## 术语参考（强烈推荐使用以下目标译文，除非语境明显冲突）"
-            )
+            parts.append(_TERM_SECTION_TITLE)
             parts.append(_format_term_section(term_matches))
 
         if references:
@@ -1000,6 +1151,8 @@ class TranslationPipeline:
         if web_refs:
             parts.append(_WEB_SECTION_HEADER)
             parts.append(_format_web_section(web_refs))
+
+        parts.append(_format_feedback_rules(content_type))
 
         parts.append("## 待翻译文本")
         parts.append(source)
@@ -1041,9 +1194,7 @@ class TranslationPipeline:
         parts: list[str] = ["## 整组翻译任务", "\n".join(intro_lines)]
 
         if term_matches:
-            parts.append(
-                "## 术语参考（强烈推荐使用以下目标译文，除非语境明显冲突）"
-            )
+            parts.append(_TERM_SECTION_TITLE)
             parts.append(_format_term_section(term_matches))
 
         if references:
@@ -1055,6 +1206,8 @@ class TranslationPipeline:
         if web_refs:
             parts.append(_WEB_SECTION_HEADER)
             parts.append(_format_web_section(web_refs))
+
+        parts.append(_format_feedback_rules(content_type))
 
         parts.append("## 源文本")
         parts.append("\n".join(f"{i}. {s}" for i, s in enumerate(sources, 1)))
@@ -1086,16 +1239,33 @@ class TranslationPipeline:
     def _refs_view(references: list[RAGSearchResult]) -> list[dict] | None:
         if not references:
             return None
-        return [
-            {"source": r.source, "target": r.target, "score": round(r.score, 4)}
-            for r in references
-        ]
+        out: list[dict] = []
+        for r in references:
+            item = {"source": r.source, "target": r.target, "score": round(r.score, 4)}
+            if r.status:
+                item["status"] = r.status
+            out.append(item)
+        return out
 
     @staticmethod
     def _web_view(web_refs: list[WebSearchResult] | None) -> list[dict] | None:
         if not web_refs:
             return None
         return [r.model_dump() for r in web_refs]
+
+
+def _merge_direct_results(
+    direct_results: list[TranslationResult | None],
+    translated_unmatched: list[TranslationResult],
+) -> list[TranslationResult]:
+    translated_iter = iter(translated_unmatched)
+    merged: list[TranslationResult] = []
+    for direct in direct_results:
+        if direct is not None:
+            merged.append(direct)
+        else:
+            merged.append(next(translated_iter))
+    return merged
 
 
 def _extract_translation_reason(text: str) -> tuple[str, str | None] | None:
@@ -1208,6 +1378,41 @@ def _parse_numbered_output(raw: str, expected: int) -> list[tuple[str, str | Non
     if set(found.keys()) != set(range(1, expected + 1)):
         return None
     return [found[i] for i in range(1, expected + 1)]
+
+
+def _format_feedback_rules(content_type: ContentType) -> str:
+    """把 LQE 人工反馈沉淀为每次翻译都会看到的操作规则。"""
+    lines = [
+        "## AIPE 反馈优化规则",
+        "- 标点与英文习惯：不要使用 em dash；中文省略号要改为英文 `...` 或重组短句；英文中使用 straight punctuation。",
+        "- 语言自然度：不要机械贴中文语序；避免重复句式和重复用词；可在不改意义的前提下调整主谓宾、连接词和信息顺序。",
+        "- 术语策略：术语/RAG 用来帮助判断专名和统一译法，不要把术语表当作逐字替换表；若术语在当前语境里只是普通含义、自称或泛称，应按英语自然表达处理。",
+        "- 人称与称谓：自称、昵称、拟声化自指、玩家称呼要先判断说话关系；自称优先转为第一人称，面向玩家的称呼可转为 you/your。",
+        "- 古典/文言感文本：先理解实词虚词和语义关系，再翻译；不要逐字对应，必要时在 reason 里说明不确定点。",
+    ]
+
+    if content_type in _FUNCTIONAL_TERM_TYPES:
+        lines.extend(
+            [
+                "- 当前文本按功能性文本处理：术语一致性优先，任务/UI/道具/技能/规则说明需稳定复用术语和高分 RAG。",
+                "- 功能性文本的译文应句式短、清楚、可执行；避免过度文学化或随意改写。",
+            ]
+        )
+    elif content_type in _CONTEXTUAL_TERM_TYPES:
+        lines.extend(
+            [
+                "- 当前文本按口语/剧情/邮件类文本处理：语气、说话人身份和上下文优先于机械术语套用。",
+                "- 口语和 playful/casual 文本应自然、轻快，可使用 contraction 和常见英语口语表达；避免商务正式腔。",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "- 当前文本类型不够明确：先判断它更像功能性说明还是叙事/口语，再决定术语强度。",
+                "- 若是系统操作、任务、道具、奖励，偏严格；若是对白、邮件、叙述、背景文案，偏自然。",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _format_term_section(term_matches: list[TermEntry]) -> str:

@@ -38,6 +38,7 @@ class FakePipeline:
         web_search_dense_threshold=None,
         enable_vision=True,
         project_id=None,
+        use_tm_exact_match=False,
     ):
         self.calls.append(text)
         self.project_ids.append(project_id)
@@ -69,6 +70,7 @@ class FakePipeline:
         web_search_dense_threshold=None,
         enable_vision=True,
         project_id=None,
+        use_tm_exact_match=False,
     ):
         self.group_calls.append(list(sources))
         self.project_ids.append(project_id)
@@ -454,6 +456,7 @@ class FakePipelineWithDialog(FakePipeline):
         web_search_dense_threshold=None,
         enable_vision=True,
         project_id=None,
+        use_tm_exact_match=False,
     ):
         self.dialog_calls.append(
             {

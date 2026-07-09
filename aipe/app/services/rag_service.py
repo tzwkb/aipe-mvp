@@ -122,6 +122,24 @@ def _dedup_by_source_target(results: list[RAGSearchResult], top_k: int) -> list[
     )[:top_k]
 
 
+def _dedup_exact_matches(results: list[RAGSearchResult], top_k: int) -> list[RAGSearchResult]:
+    """精确 source 命中结果去重排序。
+
+    精确采用 TM 时，语义相似度已经是 100% source match；排序只看 TM 质量等级，
+    同等级按 target 稳定排序，保证每次选择一致。
+    """
+    best_by_target: dict[str, RAGSearchResult] = {}
+    for r in results:
+        target_key = r.target.strip()
+        existing = best_by_target.get(target_key)
+        if existing is None or status_to_rank(r.status) < status_to_rank(existing.status):
+            best_by_target[target_key] = r
+    return sorted(
+        best_by_target.values(),
+        key=lambda x: (status_to_rank(x.status), x.target.strip()),
+    )[:top_k]
+
+
 class RAGService:
     """双语语料 RAG 服务（hybrid 检索）。
 
@@ -299,6 +317,51 @@ class RAGService:
         return done
 
     # ---------- 检索 ----------
+
+    async def find_exact_source_matches(
+        self,
+        source: str,
+        *,
+        collection: str | None = None,
+        top_k: int | None = None,
+    ) -> list[RAGSearchResult]:
+        """按 payload.source 做完全一致匹配，不调用 embedding。
+
+        这个路径用于“直接采用 TM 100% match”开关：如果命中，pipeline 会直接使用
+        target 并跳过 LLM 翻译；如果 collection 不存在或 Qdrant 异常，异常交给调用方
+        降级处理。
+        """
+        exact_source = (source or "").strip()
+        if not exact_source:
+            return []
+
+        coll = collection or self.collection
+        k = self.top_k if top_k is None else top_k
+        points, _next_page = await self._client.scroll(
+            collection_name=coll,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="source",
+                        match=models.MatchValue(value=exact_source),
+                    )
+                ]
+            ),
+            limit=max(k * 5, k),
+            with_payload=True,
+            with_vectors=False,
+        )
+        raw = [
+            RAGSearchResult(
+                source=str((p.payload or {}).get("source", "")),
+                target=str((p.payload or {}).get("target", "")),
+                score=1.0,
+                status=(p.payload or {}).get("status") or None,
+            )
+            for p in points
+            if (p.payload or {}).get("source") == exact_source and (p.payload or {}).get("target")
+        ]
+        return _dedup_exact_matches(raw, k)
 
     async def search(
         self,

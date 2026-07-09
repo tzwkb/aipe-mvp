@@ -13,7 +13,7 @@ from app.schemas.terminology import TermEntry
 from app.schemas.web_search import WebSearchResult
 from app.services.project_service import ProjectRegistry, ProjectResourceManager
 from app.services.rag_service import RAGDiagnostics
-from app.services.style_guide_service import StyleGuideService
+from app.services.style_guide_service import ContentType, StyleGuideService
 from app.services.terminology_service import TerminologyService
 from app.services.translation_pipeline import TranslationPipeline
 
@@ -55,6 +55,7 @@ class FakeRAG:
         results: list[RAGSearchResult] | None = None,
         raise_exc: Exception | None = None,
         results_by_query: dict[str, list[RAGSearchResult]] | None = None,
+        exact_results_by_query: dict[str, list[RAGSearchResult]] | None = None,
         top_k: int = 3,
         diagnostics: RAGDiagnostics | None = None,
         diagnostics_by_query: dict[str, RAGDiagnostics] | None = None,
@@ -62,8 +63,10 @@ class FakeRAG:
         self._results = results or []
         self._raise = raise_exc
         self._by_query = results_by_query or {}
+        self._exact_by_query = exact_results_by_query or {}
         self.top_k = top_k
         self.calls: list[tuple[str, float | None, int | None]] = []
+        self.exact_calls: list[tuple[str, str | None, int | None]] = []
         self.diag_calls: list[str] = []
         self._diag_default = diagnostics or RAGDiagnostics(dense_top1=0.9, sparse_hits=1)
         self._diag_by_query = diagnostics_by_query or {}
@@ -87,6 +90,13 @@ class FakeRAG:
         results = list(self._by_query.get(query, self._results))
         diag = self._diag_by_query.get(query, self._diag_default)
         return results, diag
+
+    async def find_exact_source_matches(self, source, collection=None, top_k=None):
+        self.exact_calls.append((source, collection, top_k))
+        self.collection_calls.append(collection)
+        if self._raise:
+            raise self._raise
+        return list(self._exact_by_query.get(source, []))[: top_k or self.top_k]
 
 
 class FakeWebSearch:
@@ -303,6 +313,52 @@ def test_translate_single_no_term_match_skips_term_section():
     assert "术语参考" not in user_msg
 
 
+def test_translate_single_speech_prompt_softens_terms_and_self_reference():
+    terms = [TermEntry(source="燕叽", target="Windtail")]
+    pipe, _, _, llm = _make_pipeline(terms=terms, llm_response_fn=lambda msgs: "I got it.")
+
+    asyncio.run(
+        pipe.translate_single(
+            "燕叽这就去看看！",
+            content_type=ContentType.SPEECH,
+        )
+    )
+
+    user_msg = llm.calls[0][1]["content"]
+    assert "口语/剧情/邮件类文本" in user_msg
+    assert "自称" in user_msg
+    assert "第一人称" in user_msg
+    assert "不要把术语表当作逐字替换表" in user_msg
+
+
+def test_translate_single_functional_prompt_keeps_terms_strict_and_concise():
+    terms = [TermEntry(source="燕云", target="Where Winds Meet")]
+    pipe, _, _, llm = _make_pipeline(terms=terms, llm_response_fn=lambda msgs: "Task text.")
+
+    asyncio.run(
+        pipe.translate_single(
+            "前往燕云完成任务",
+            content_type=ContentType.QUEST_OBJECTIVE,
+        )
+    )
+
+    user_msg = llm.calls[0][1]["content"]
+    assert "功能性文本" in user_msg
+    assert "术语一致性优先" in user_msg
+    assert "句式短、清楚、可执行" in user_msg
+
+
+def test_translate_single_prompt_includes_wwm_feedback_hard_style_rules():
+    pipe, _, _, llm = _make_pipeline(llm_response_fn=lambda msgs: "ok")
+
+    asyncio.run(pipe.translate_single("这……这可怎么好……", content_type=ContentType.STORY))
+
+    user_msg = llm.calls[0][1]["content"]
+    assert "不要使用 em dash" in user_msg
+    assert "中文省略号" in user_msg
+    assert "straight punctuation" in user_msg
+
+
 def test_translate_single_does_not_mutate_source_for_llm():
     """确认改造后不再做占位符替换：LLM 拿到的是原文。"""
     terms = [TermEntry(source="燕云", target="Yanyun")]
@@ -360,6 +416,82 @@ def test_translate_single_rag_failure_is_swallowed():
     result = asyncio.run(pipe.translate_single("任意文本"))
     assert result.status == "success"
     assert result.rag_references is None
+
+
+def test_translate_single_tm_exact_match_can_skip_ai_translation():
+    exact = RAGSearchResult(
+        source="契丹来犯",
+        target="The Khitan are attacking",
+        score=1.0,
+        status="Designer Reviewed",
+    )
+    rag = FakeRAG(exact_results_by_query={"契丹来犯": [exact]})
+    llm = FakeLLM(response_fn=lambda m: "AI should not run")
+    pipe = TranslationPipeline(TerminologyService(), rag, StyleGuideService(), llm)
+
+    result = asyncio.run(
+        pipe.translate_single(
+            "契丹来犯",
+            content_type=ContentType.QUEST_DESCRIPTION,
+            use_tm_exact_match=True,
+        )
+    )
+
+    assert result.status == "success"
+    assert result.translation == "The Khitan are attacking"
+    assert result.translation_reason and "TM_EXACT_MATCH" in result.translation_reason
+    assert result.tm_exact_match_used is True
+    assert result.tm_exact_match_source == "契丹来犯"
+    assert result.tm_exact_match_target == "The Khitan are attacking"
+    assert result.tm_exact_match_status == "Designer Reviewed"
+    assert result.tm_exact_match_score == 1.0
+    assert result.rag_references == [
+        {
+            "source": "契丹来犯",
+            "target": "The Khitan are attacking",
+            "score": 1.0,
+            "status": "Designer Reviewed",
+        }
+    ]
+    assert rag.exact_calls == [("契丹来犯", None, 1)]
+    assert llm.calls == []
+    assert llm.classify_calls == []
+
+
+def test_translate_single_tm_exact_match_default_keeps_ai_flow():
+    exact = RAGSearchResult(source="契丹来犯", target="The Khitan are attacking", score=1.0)
+    rag = FakeRAG(exact_results_by_query={"契丹来犯": [exact]})
+    llm = FakeLLM(response_fn=lambda m: "AI translation")
+    pipe = TranslationPipeline(TerminologyService(), rag, StyleGuideService(), llm)
+
+    result = asyncio.run(pipe.translate_single("契丹来犯", content_type=ContentType.QUEST_DESCRIPTION))
+
+    assert result.translation == "AI translation"
+    assert result.tm_exact_match_used is False
+    assert rag.exact_calls == []
+    assert len(llm.calls) == 1
+
+
+def test_translate_group_tm_exact_match_only_translates_unmatched_sources():
+    exact = RAGSearchResult(source="源1", target="TM target 1", score=1.0, status="Done")
+    rag = FakeRAG(exact_results_by_query={"源1": [exact]})
+    llm = FakeLLM(response_fn=lambda m: '{"translation": "AI target 2", "reason": "AI"}')
+    pipe = TranslationPipeline(TerminologyService(), rag, StyleGuideService(), llm)
+
+    results = asyncio.run(
+        pipe.translate_group(
+            ["源1", "源2"],
+            content_type=ContentType.UI,
+            use_tm_exact_match=True,
+        )
+    )
+
+    assert [r.translation for r in results] == ["TM target 1", "AI target 2"]
+    assert [r.tm_exact_match_used for r in results] == [True, False]
+    assert len(llm.calls) == 1
+    user_msg = llm.calls[0][1]["content"]
+    assert "源2" in user_msg
+    assert "源1" not in user_msg
 
 
 # ---------- 整组翻译路径 ----------

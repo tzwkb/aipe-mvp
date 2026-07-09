@@ -27,6 +27,25 @@ router = APIRouter(prefix="/translate", tags=["translate"])
 
 _MAX_TEXTS_PER_REQUEST = 5000  # 单次请求上限：超过应该走文件上传
 
+_CSV_HEADER = [
+    "source",
+    "translation",
+    "translation_reason",
+    "status",
+    "content_type",
+    "terminology_used",
+    "rag_references",
+    "tm_exact_match_used",
+    "tm_exact_match_source",
+    "tm_exact_match_target",
+    "tm_exact_match_status",
+    "tm_exact_match_score",
+    "web_references",
+    "web_search_triggered",
+    "image_analysis",
+    "error_msg",
+]
+
 
 def _new_task_id() -> str:
     return uuid.uuid4().hex[:16]
@@ -47,13 +66,14 @@ async def translate(
 
     task_id = request.task_id or _new_task_id()
     logger.info(
-        "translate 接收: task=%s total=%d batch=%d enable_rag=%s enable_web_search=%s enable_vision=%s",
+        "translate 接收: task=%s total=%d batch=%d enable_rag=%s enable_web_search=%s enable_vision=%s use_tm_exact_match=%s",
         task_id,
         len(request.texts),
         request.batch_size,
         request.enable_rag,
         request.enable_web_search,
         request.enable_vision,
+        request.use_tm_exact_match,
     )
     return await processor.process(
         texts=request.texts,
@@ -68,6 +88,7 @@ async def translate(
         enable_web_search=request.enable_web_search,
         web_search_dense_threshold=request.web_search_dense_threshold,
         enable_vision=request.enable_vision,
+        use_tm_exact_match=request.use_tm_exact_match,
     )
 
 
@@ -110,6 +131,10 @@ async def translate_file(
         True,
         description="是否启用多模态模型对 Web 搜索配图进行分析；关闭后 image_analysis 始终为 None",
     ),
+    use_tm_exact_match: bool = Form(
+        False,
+        description="是否直接采用 TM 精确源文匹配结果；命中则跳过 LLM 翻译，未命中照常翻译",
+    ),
     task_id: str | None = Form(None),
     processor: BatchProcessor = Depends(get_batch_processor),
 ) -> BatchTranslateResponse:
@@ -143,7 +168,7 @@ async def translate_file(
 
     tid = task_id or _new_task_id()
     logger.info(
-        "translate/file 接收: task=%s filename=%s total=%d enable_cluster=%s dialog_mode=%s enable_web_search=%s enable_vision=%s",
+        "translate/file 接收: task=%s filename=%s total=%d enable_cluster=%s dialog_mode=%s enable_web_search=%s enable_vision=%s use_tm_exact_match=%s",
         tid,
         filename,
         len(texts),
@@ -151,6 +176,7 @@ async def translate_file(
         dialog_mode,
         enable_web_search,
         enable_vision,
+        use_tm_exact_match,
     )
     return await processor.process(
         texts=texts,
@@ -170,6 +196,7 @@ async def translate_file(
         enable_web_search=enable_web_search,
         web_search_dense_threshold=web_search_dense_threshold,
         enable_vision=enable_vision,
+        use_tm_exact_match=use_tm_exact_match,
     )
 
 
@@ -190,7 +217,7 @@ async def get_task(
 
 @router.get(
     "/task/{task_id}/csv",
-    summary="导出任务结果为 CSV（source,translation,translation_reason,status,content_type,terminology_used,rag_references,web_references,web_search_triggered,image_analysis,error_msg）",
+    summary="导出任务结果为 CSV（含 TM 精确匹配标记列）",
 )
 async def export_task_csv(
     task_id: str,
@@ -203,21 +230,7 @@ async def export_task_csv(
     buf = io.StringIO()
     # utf-8-sig 让 Excel 直接识别为 UTF-8。
     writer = csv.writer(buf)
-    writer.writerow(
-        [
-            "source",
-            "translation",
-            "translation_reason",
-            "status",
-            "content_type",
-            "terminology_used",
-            "rag_references",
-            "web_references",
-            "web_search_triggered",
-            "image_analysis",
-            "error_msg",
-        ]
-    )
+    writer.writerow(_CSV_HEADER)
     for r in resp.results:
         term_json = json.dumps(r.terminology_used, ensure_ascii=False) if r.terminology_used else ""
         rag_json = (
@@ -236,6 +249,11 @@ async def export_task_csv(
                 r.content_type or "",
                 term_json,
                 rag_json,
+                str(r.tm_exact_match_used).lower(),
+                r.tm_exact_match_source or "",
+                r.tm_exact_match_target or "",
+                r.tm_exact_match_status or "",
+                "" if r.tm_exact_match_score is None else str(r.tm_exact_match_score),
                 web_json,
                 web_triggered,
                 r.image_analysis or "",

@@ -35,6 +35,13 @@ class TranslateRequest(BaseModel):
             "仅在 enable_web_search=True 且触发了 Web 搜索时生效；关闭后 image_analysis 始终为 None。"
         ),
     )
+    use_tm_exact_match: bool = Field(
+        False,
+        description=(
+            "是否直接采用 TM 精确源文匹配结果。开启后，如果 RAG/TM collection 中存在 source 完全相同的条目，"
+            "直接使用该 target 作为译文并跳过 LLM 翻译；未命中则照常翻译。"
+        ),
+    )
 
 
 class TranslationResult(BaseModel):
@@ -57,6 +64,11 @@ class TranslationResult(BaseModel):
         None,
         description="多模态 LLM 对 Web 搜索配图的分析结果；未触发 web search 或无配图时为 None",
     )
+    tm_exact_match_used: bool = Field(False, description="是否直接采用了 TM 精确源文匹配结果")
+    tm_exact_match_source: str | None = Field(None, description="被直接采用的 TM 原文")
+    tm_exact_match_target: str | None = Field(None, description="被直接采用的 TM 译文")
+    tm_exact_match_status: str | None = Field(None, description="被直接采用的 TM 审校状态")
+    tm_exact_match_score: float | None = Field(None, description="TM 精确匹配分数；精确源文命中固定为 1.0")
     error_msg: str | None = Field(None, description="错误信息")
 
 

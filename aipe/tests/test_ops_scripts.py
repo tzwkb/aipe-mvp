@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def test_create_project_profile_writes_relative_assets(tmp_path):
@@ -120,6 +121,56 @@ def test_run_checks_builds_docker_command_for_selected_tests():
     assert cmd[:4] == ["docker", "compose", "run", "--rm"]
     assert "/repo/aipe:/work" in cmd
     assert cmd[-2:] == ["-c", "python -m pip install pytest -q && python -m compileall -q app scripts tests && python -m pytest -q tests/test_project_profiles.py"]
+
+
+def test_batch_translate_defaults_to_project_profile_collection():
+    from scripts.batch_translate_files import build_translate_params
+
+    args = SimpleNamespace(
+        batch_size=20,
+        project_id="wwm/zh-en",
+        rag_collection=None,
+        rag_threshold=0.85,
+        rag_top_k=3,
+        enable_rag=True,
+        enable_cluster=True,
+        dialog_mode=False,
+        enable_web_search=True,
+        web_search_dense_threshold=0.85,
+        enable_vision=False,
+        use_tm_exact_match=False,
+    )
+
+    params = build_translate_params(args, task_id="task_1")
+
+    assert params["project_id"] == "wwm/zh-en"
+    assert params["task_id"] == "task_1"
+    assert params["use_tm_exact_match"] == "false"
+    assert "rag_collection" not in params
+
+
+def test_batch_translate_allows_explicit_collection_override():
+    from scripts.batch_translate_files import build_translate_params
+
+    args = SimpleNamespace(
+        batch_size=20,
+        project_id="wwm/zh-en",
+        rag_collection="custom_corpus",
+        rag_threshold=0.85,
+        rag_top_k=3,
+        enable_rag=True,
+        enable_cluster=True,
+        dialog_mode=False,
+        enable_web_search=True,
+        web_search_dense_threshold=0.85,
+        enable_vision=False,
+        use_tm_exact_match=True,
+    )
+
+    params = build_translate_params(args, task_id="task_1")
+
+    assert params["rag_collection"] == "custom_corpus"
+    assert params["use_tm_exact_match"] == "true"
 
 
 def test_verify_stack_builds_health_url():

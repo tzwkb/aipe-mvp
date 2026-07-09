@@ -11,6 +11,7 @@ corpus/
 cleaned_corpus/
 run/
 aipe/data/
+archive/
 
 # python
 __pycache__/
