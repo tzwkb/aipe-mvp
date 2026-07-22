@@ -6,7 +6,6 @@ LLM / Embedding 全部用 fake 实现，不依赖任何外部服务。
 from __future__ import annotations
 
 import asyncio
-import json
 
 from app.schemas.rag import RAGSearchResult
 from app.schemas.terminology import TermEntry
@@ -16,204 +15,14 @@ from app.services.rag_service import RAGDiagnostics
 from app.services.style_guide_service import ContentType, StyleGuideService
 from app.services.terminology_service import TerminologyService
 from app.services.translation_pipeline import TranslationPipeline
-
-
-class FakeLLM:
-    """记录 messages 的伪 LLM。``response_fn`` 决定返回内容。"""
-
-    def __init__(self, response_fn=None, classify_fn=None):
-        self.calls: list[list[dict]] = []
-        self.classify_calls: list[list[dict]] = []
-        self.response_fn = response_fn or (lambda msgs: "stubbed translation")
-        self.classify_fn = classify_fn or (lambda msgs: "未知")
-
-    async def translate(self, prompt, *, temperature=None, max_retries=None):
-        msgs = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
-        self.calls.append(msgs)
-        out = self.response_fn(msgs)
-        if asyncio.iscoroutine(out):
-            return await out
-        return out
-
-    async def classify(self, messages):
-        self.classify_calls.append(messages)
-        out = self.classify_fn(messages)
-        if asyncio.iscoroutine(out):
-            return await out
-        return out
-
-    async def embed(self, text):
-        return [0.0]
-
-    async def embed_batch(self, texts):
-        return [[0.0] for _ in texts]
-
-
-class FakeRAG:
-    def __init__(
-        self,
-        results: list[RAGSearchResult] | None = None,
-        raise_exc: Exception | None = None,
-        results_by_query: dict[str, list[RAGSearchResult]] | None = None,
-        exact_results_by_query: dict[str, list[RAGSearchResult]] | None = None,
-        top_k: int = 3,
-        diagnostics: RAGDiagnostics | None = None,
-        diagnostics_by_query: dict[str, RAGDiagnostics] | None = None,
-    ):
-        self._results = results or []
-        self._raise = raise_exc
-        self._by_query = results_by_query or {}
-        self._exact_by_query = exact_results_by_query or {}
-        self.top_k = top_k
-        self.calls: list[tuple[str, float | None, int | None]] = []
-        self.exact_calls: list[tuple[str, str | None, int | None]] = []
-        self.diag_calls: list[str] = []
-        self._diag_default = diagnostics or RAGDiagnostics(dense_top1=0.9, sparse_hits=1)
-        self._diag_by_query = diagnostics_by_query or {}
-        self.collection_calls: list[str | None] = []
-
-    async def search(self, query, threshold=None, top_k=None, collection=None):
-        self.calls.append((query, threshold, top_k))
-        self.collection_calls.append(collection)
-        if self._raise:
-            raise self._raise
-        if query in self._by_query:
-            return list(self._by_query[query])
-        return list(self._results)
-
-    async def search_with_diagnostics(self, query, threshold=None, top_k=None, collection=None):
-        self.calls.append((query, threshold, top_k))
-        self.collection_calls.append(collection)
-        self.diag_calls.append(query)
-        if self._raise:
-            raise self._raise
-        results = list(self._by_query.get(query, self._results))
-        diag = self._diag_by_query.get(query, self._diag_default)
-        return results, diag
-
-    async def find_exact_source_matches(self, source, collection=None, top_k=None):
-        self.exact_calls.append((source, collection, top_k))
-        self.collection_calls.append(collection)
-        if self._raise:
-            raise self._raise
-        return list(self._exact_by_query.get(source, []))[: top_k or self.top_k]
-
-
-class FakeWebSearch:
-    """伪 WebSearchService：记录 search 调用并可配置返回结果或抛异常。"""
-
-    def __init__(
-        self,
-        results: list[WebSearchResult] | None = None,
-        raise_exc: Exception | None = None,
-        enabled: bool = True,
-    ):
-        self.enabled = enabled
-        self._results = results or []
-        self._raise = raise_exc
-        self.calls: list[str] = []
-
-    async def search(self, query: str, *, prefix: str | None = None):
-        self.calls.append(query)
-        if self._raise:
-            raise self._raise
-        return list(self._results)
-
-
-def _make_pipeline(
-    *,
-    terms: list[TermEntry] | None = None,
-    style_rules: str = "保持武侠调性。",
-    rag_results: list[RAGSearchResult] | None = None,
-    llm_response_fn=None,
-    rag_exc: Exception | None = None,
-    diagnostics: RAGDiagnostics | None = None,
-    web_search: "FakeWebSearch | None" = None,
-    web_search_dense_threshold: float = 0.6,
-):
-    term_svc = TerminologyService()
-    if terms:
-        term_svc.load(terms)
-
-    style_svc = StyleGuideService()
-    if style_rules:
-        style_svc.load(style_rules, filename="test.md")
-
-    rag = FakeRAG(rag_results, raise_exc=rag_exc, diagnostics=diagnostics)
-    llm = FakeLLM(response_fn=llm_response_fn)
-    pipe = TranslationPipeline(
-        term_svc,
-        rag,
-        style_svc,
-        llm,
-        web_search_svc=web_search,
-        web_search_dense_threshold=web_search_dense_threshold,
-    )
-    return pipe, term_svc, rag, llm
-
-
-def _write_project(
-    root,
-    name: str,
-    *,
-    language_pair: str = "ZH-EN",
-    source_lang: str = "zh",
-    target_lang: str = "en",
-    term_source: str,
-    term_target: str,
-    style: str,
-    collection: str,
-) -> None:
-    project_dir = root / name
-    project_dir.mkdir(parents=True)
-    (project_dir / "terms.json").write_text(
-        json.dumps([{"source": term_source, "target": term_target}], ensure_ascii=False),
-        encoding="utf-8",
-    )
-    (project_dir / "style.md").write_text(style, encoding="utf-8")
-    (project_dir / "profile.json").write_text(
-        json.dumps(
-            {
-                "name": name,
-                "language_pair": language_pair,
-                "source_lang": source_lang,
-                "target_lang": target_lang,
-                "game": name,
-                "style_guide": "style.md",
-                "terminology": "terms.json",
-                "qdrant_collection": collection,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_min_project(
-    root,
-    name: str,
-    *,
-    language_pair: str,
-    source_lang: str,
-    target_lang: str,
-    collection: str,
-) -> None:
-    project_dir = root / name
-    project_dir.mkdir(parents=True)
-    (project_dir / "profile.json").write_text(
-        json.dumps(
-            {
-                "name": name,
-                "language_pair": language_pair,
-                "source_lang": source_lang,
-                "target_lang": target_lang,
-                "game": "Isekai",
-                "qdrant_collection": collection,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+from tests.pipeline_fakes import (
+    FakeLLM,
+    FakeRAG,
+    FakeWebSearch,
+    make_pipeline as _make_pipeline,
+    write_min_project as _write_min_project,
+    write_project as _write_project,
+)
 
 
 def test_translate_single_happy_path():
@@ -301,6 +110,9 @@ def test_translate_single_project_language_pair_overrides_hardcoded_english(tmp_
     assert "目标语言：German" in system_msg
     assert "翻译为英文" not in system_msg
     assert "英文译文" not in user_msg
+    assert "不要使用 em dash" not in user_msg
+    assert "straight punctuation" not in user_msg
+    assert "contraction" not in user_msg
 
 
 def test_translate_single_no_term_match_skips_term_section():
@@ -346,6 +158,21 @@ def test_translate_single_functional_prompt_keeps_terms_strict_and_concise():
     assert "功能性文本" in user_msg
     assert "术语一致性优先" in user_msg
     assert "句式短、清楚、可执行" in user_msg
+
+
+def test_translate_single_quest_description_uses_contextual_prompt_rules():
+    pipe, _, _, llm = _make_pipeline(llm_response_fn=lambda msgs: "Narrative quest text.")
+
+    asyncio.run(
+        pipe.translate_single(
+            "暮色笼罩村庄，一阵低语从古井深处传来。",
+            content_type=ContentType.QUEST_DESCRIPTION,
+        )
+    )
+
+    user_msg = llm.calls[0][1]["content"]
+    assert "按口语/剧情/邮件类文本处理" in user_msg
+    assert "按功能性文本处理" not in user_msg
 
 
 def test_translate_single_prompt_includes_wwm_feedback_hard_style_rules():
@@ -453,7 +280,8 @@ def test_translate_single_tm_exact_match_can_skip_ai_translation():
             "status": "Designer Reviewed",
         }
     ]
-    assert rag.exact_calls == [("契丹来犯", None, 1)]
+    assert rag.exact_calls == []
+    assert rag.exact_batch_calls == [(["契丹来犯"], None, 1)]
     assert llm.calls == []
     assert llm.classify_calls == []
 
@@ -472,10 +300,19 @@ def test_translate_single_tm_exact_match_default_keeps_ai_flow():
     assert len(llm.calls) == 1
 
 
-def test_translate_group_tm_exact_match_only_translates_unmatched_sources():
+def test_translate_group_partial_tm_match_preserves_full_context():
     exact = RAGSearchResult(source="源1", target="TM target 1", score=1.0, status="Done")
     rag = FakeRAG(exact_results_by_query={"源1": [exact]})
-    llm = FakeLLM(response_fn=lambda m: '{"translation": "AI target 2", "reason": "AI"}')
+    def respond(messages):
+        user_msg = messages[-1]["content"]
+        if "整组翻译任务" in user_msg:
+            return (
+                '1. {"translation": "ignored AI target 1", "reason": "locked"}\n'
+                '2. {"translation": "AI target 2", "reason": "AI"}'
+            )
+        return '{"translation": "AI target 2", "reason": "AI"}'
+
+    llm = FakeLLM(response_fn=respond)
     pipe = TranslationPipeline(TerminologyService(), rag, StyleGuideService(), llm)
 
     results = asyncio.run(
@@ -491,7 +328,57 @@ def test_translate_group_tm_exact_match_only_translates_unmatched_sources():
     assert len(llm.calls) == 1
     user_msg = llm.calls[0][1]["content"]
     assert "源2" in user_msg
-    assert "源1" not in user_msg
+    assert "源1" in user_msg
+    assert "已锁定 TM 译文" in user_msg
+    assert "TM target 1" in user_msg
+    assert rag.exact_calls == []
+    assert rag.exact_batch_calls == [(["源1", "源2"], None, 1)]
+
+
+def test_translate_dialog_partial_tm_match_preserves_full_context():
+    exact_by_query = {
+        "前文": [RAGSearchResult(source="前文", target="TM previous", score=1.0, status="Done")],
+        "后文": [RAGSearchResult(source="后文", target="TM following", score=1.0, status="Done")],
+    }
+    rag = FakeRAG(exact_results_by_query=exact_by_query)
+
+    def respond(messages):
+        user_msg = messages[-1]["content"]
+        if "对话翻译任务" in user_msg:
+            return (
+                '1. {"translation": "ignored previous", "reason": "locked"}\n'
+                '2. {"translation": "AI middle", "reason": "context"}\n'
+                '3. {"translation": "ignored following", "reason": "locked"}'
+            )
+        return '{"translation": "AI middle", "reason": "no context"}'
+
+    llm = FakeLLM(response_fn=respond)
+    pipe = TranslationPipeline(TerminologyService(), rag, StyleGuideService(), llm)
+
+    results = asyncio.run(
+        pipe.translate_dialog(
+            ["前文", "需要上下文", "后文"],
+            ["甲", "乙", "甲"],
+            dialog_id="dialog-1",
+            content_type=ContentType.SPEECH,
+            use_tm_exact_match=True,
+        )
+    )
+
+    assert [result.translation for result in results] == [
+        "TM previous",
+        "AI middle",
+        "TM following",
+    ]
+    user_msg = llm.calls[0][1]["content"]
+    assert "对话翻译任务" in user_msg
+    assert all(source in user_msg for source in ["前文", "需要上下文", "后文"])
+    assert "[乙] 需要上下文" in user_msg
+    assert "已锁定 TM 译文" in user_msg
+    assert "TM previous" in user_msg
+    assert "TM following" in user_msg
+    assert rag.exact_calls == []
+    assert rag.exact_batch_calls == [(["前文", "需要上下文", "后文"], None, 1)]
 
 
 # ---------- 整组翻译路径 ----------

@@ -43,6 +43,8 @@ _INGEST_BATCH_SIZE = 30
 # 命名向量名（与 collection schema 绑定，改名需重建 collection）
 _VEC_DENSE = "dense"
 _VEC_SPARSE = "sparse"
+_SOURCE_PAYLOAD_FIELD = "source"
+_EXACT_SCROLL_PAGE_SIZE = 256
 
 # 仅保留 CJK / 英文 / 数字 token，过滤标点空白
 _TOKEN_KEEP = re.compile(r"[一-鿿0-9A-Za-z]+")
@@ -160,7 +162,9 @@ class RAGService:
         self._client_loop: asyncio.AbstractEventLoop | None = None
         self._vector_size: int | None = None
         self._collection_ready: set[str] = set()
+        self._source_index_ready: set[str] = set()
         self._init_lock = asyncio.Lock()
+        self._source_index_lock = asyncio.Lock()
 
     @property
     def _client(self) -> AsyncQdrantClient:
@@ -227,6 +231,28 @@ class RAGService:
                 )
             logger.info("RAG hybrid collection 已存在: %s", collection)
             self._collection_ready.add(collection)
+
+    async def _ensure_source_payload_index(self, collection: str) -> None:
+        if collection in self._source_index_ready:
+            return
+        async with self._source_index_lock:
+            if collection in self._source_index_ready:
+                return
+            info = await self._client.get_collection(collection)
+            payload_schema = getattr(info, "payload_schema", None) or {}
+            if _SOURCE_PAYLOAD_FIELD not in payload_schema:
+                await self._client.create_payload_index(
+                    collection_name=collection,
+                    field_name=_SOURCE_PAYLOAD_FIELD,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                    wait=True,
+                )
+                logger.info(
+                    "RAG payload index 已创建: collection=%s field=%s type=keyword",
+                    collection,
+                    _SOURCE_PAYLOAD_FIELD,
+                )
+            self._source_index_ready.add(collection)
 
     async def _create_hybrid_collection(self, collection: str) -> None:
         await self._client.create_collection(
@@ -334,34 +360,80 @@ class RAGService:
         exact_source = (source or "").strip()
         if not exact_source:
             return []
+        matches = await self.find_exact_source_matches_many(
+            [exact_source],
+            collection=collection,
+            top_k=top_k,
+        )
+        return matches[exact_source]
+
+    async def find_exact_source_matches_many(
+        self,
+        sources: Iterable[str],
+        *,
+        collection: str | None = None,
+        top_k: int | None = None,
+    ) -> dict[str, list[RAGSearchResult]]:
+        """批量查询完全一致的 payload.source；分页收齐后再按 TM 质量排序。"""
+        exact_sources = list(
+            dict.fromkeys((source or "").strip() for source in sources if (source or "").strip())
+        )
+        if not exact_sources:
+            return {}
 
         coll = collection or self.collection
         k = self.top_k if top_k is None else top_k
-        points, _next_page = await self._client.scroll(
-            collection_name=coll,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="source",
-                        match=models.MatchValue(value=exact_source),
-                    )
-                ]
-            ),
-            limit=max(k * 5, k),
-            with_payload=True,
-            with_vectors=False,
-        )
-        raw = [
-            RAGSearchResult(
-                source=str((p.payload or {}).get("source", "")),
-                target=str((p.payload or {}).get("target", "")),
-                score=1.0,
-                status=(p.payload or {}).get("status") or None,
+        if k <= 0:
+            return {source: [] for source in exact_sources}
+
+        await self._ensure_source_payload_index(coll)
+        source_set = set(exact_sources)
+        raw_by_source: dict[str, list[RAGSearchResult]] = {
+            source: [] for source in exact_sources
+        }
+        offset = None
+        while True:
+            points, next_offset = await self._client.scroll(
+                collection_name=coll,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key=_SOURCE_PAYLOAD_FIELD,
+                            match=models.MatchAny(any=exact_sources),
+                        )
+                    ]
+                ),
+                limit=_EXACT_SCROLL_PAGE_SIZE,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
             )
-            for p in points
-            if (p.payload or {}).get("source") == exact_source and (p.payload or {}).get("target")
-        ]
-        return _dedup_exact_matches(raw, k)
+            for point in points:
+                payload = point.payload or {}
+                matched_source = str(payload.get(_SOURCE_PAYLOAD_FIELD, ""))
+                target = payload.get("target")
+                if matched_source not in source_set or not target:
+                    continue
+                raw_by_source[matched_source].append(
+                    RAGSearchResult(
+                        source=matched_source,
+                        target=str(target),
+                        score=1.0,
+                        status=payload.get("status") or None,
+                    )
+                )
+            if next_offset is None:
+                break
+            if next_offset == offset:
+                raise TranslationError(
+                    f"Qdrant exact-match scroll offset 未推进: collection={coll} offset={offset}"
+                )
+            offset = next_offset
+
+        return {
+            source: _dedup_exact_matches(raw_by_source[source], k)
+            for source in exact_sources
+        }
 
     async def search(
         self,
@@ -534,6 +606,7 @@ class RAGService:
         except (UnexpectedResponse, ValueError):
             pass
         self._collection_ready.discard(coll)
+        self._source_index_ready.discard(coll)
         await self._ensure_collection(coll)
 
     async def aclose(self) -> None:
@@ -545,6 +618,7 @@ class RAGService:
             self._client_instance = None
             self._client_loop = None
             self._init_lock = asyncio.Lock()
+            self._source_index_lock = asyncio.Lock()
 
 
 # ---------- 模块级单例 ----------

@@ -198,15 +198,31 @@ def _state_mismatches(state: dict[str, Any], requested: dict[str, Any]) -> list[
         if existing and existing != requested[key]:
             mismatches.append(key)
 
-    existing_context = state.get("context") or {}
-    requested_context = requested.get("context") or {}
-    if existing_context or requested_context:
-        if not existing_context and requested_context:
+    existing_context_raw = state.get("context") or {}
+    requested_context_raw = requested.get("context") or {}
+    if existing_context_raw or requested_context_raw:
+        if not existing_context_raw and requested_context_raw:
+            legacy_tm_enabled = _context_with_compat_defaults(existing_context_raw)[
+                "use_tm_exact_match"
+            ]
+            requested_tm_enabled = _context_with_compat_defaults(requested_context_raw)[
+                "use_tm_exact_match"
+            ]
+            if legacy_tm_enabled != requested_tm_enabled:
+                mismatches.append("context.use_tm_exact_match")
             return mismatches
+        existing_context = _context_with_compat_defaults(existing_context_raw)
+        requested_context = _context_with_compat_defaults(requested_context_raw)
         if existing_context != requested_context:
             changed = sorted(set(existing_context) | set(requested_context))
             mismatches.extend(f"context.{key}" for key in changed if existing_context.get(key) != requested_context.get(key))
     return mismatches
+
+
+def _context_with_compat_defaults(context: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(context)
+    normalized.setdefault("use_tm_exact_match", False)
+    return normalized
 
 
 def _now_iso() -> str:

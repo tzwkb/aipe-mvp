@@ -73,6 +73,98 @@ def test_init_preserves_existing_state(tmp_progress):
     assert state["completed_indices"] == [0]
 
 
+def test_init_treats_missing_tm_exact_flag_as_legacy_false(tmp_progress):
+    tr = ProgressTracker("task_legacy_tm_context", tmp_progress)
+    legacy_context = {"project_id": "wwm/zh-en", "enable_rag": True}
+    asyncio.run(
+        tr.init(
+            total=1,
+            batch_size=1,
+            total_batches=1,
+            sources=["source"],
+            content_types=[None],
+            units=[[0]],
+            orig_to_unique=[0],
+            context=legacy_context,
+        )
+    )
+
+    state = asyncio.run(
+        tr.init(
+            total=1,
+            batch_size=1,
+            total_batches=1,
+            sources=["source"],
+            content_types=[None],
+            units=[[0]],
+            orig_to_unique=[0],
+            context={**legacy_context, "use_tm_exact_match": False},
+        )
+    )
+
+    assert state["context"] == legacy_context
+
+
+def test_init_rejects_enabling_tm_exact_for_legacy_progress(tmp_progress):
+    tr = ProgressTracker("task_legacy_tm_context_true", tmp_progress)
+    legacy_context = {"project_id": "wwm/zh-en", "enable_rag": True}
+    asyncio.run(
+        tr.init(
+            total=1,
+            batch_size=1,
+            total_batches=1,
+            sources=["source"],
+            content_types=[None],
+            units=[[0]],
+            orig_to_unique=[0],
+            context=legacy_context,
+        )
+    )
+
+    with pytest.raises(ValueError, match="context.use_tm_exact_match"):
+        asyncio.run(
+            tr.init(
+                total=1,
+                batch_size=1,
+                total_batches=1,
+                sources=["source"],
+                content_types=[None],
+                units=[[0]],
+                orig_to_unique=[0],
+                context={**legacy_context, "use_tm_exact_match": True},
+            )
+        )
+
+
+@pytest.mark.parametrize("legacy_context_state", ["empty", "missing"])
+def test_init_rejects_enabling_tm_exact_when_legacy_context_is_empty(
+    tmp_progress, legacy_context_state
+):
+    tr = ProgressTracker(f"task_legacy_empty_context_{legacy_context_state}", tmp_progress)
+    init_args = {
+        "total": 1,
+        "batch_size": 1,
+        "total_batches": 1,
+        "sources": ["source"],
+        "content_types": [None],
+        "units": [[0]],
+        "orig_to_unique": [0],
+    }
+    asyncio.run(tr.init(**init_args, context={}))
+    if legacy_context_state == "missing":
+        legacy_state = json.loads(tr.file_path.read_text(encoding="utf-8"))
+        legacy_state.pop("context")
+        tr.file_path.write_text(json.dumps(legacy_state), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="context.use_tm_exact_match"):
+        asyncio.run(
+            tr.init(
+                **init_args,
+                context={"project_id": "wwm/zh-en", "use_tm_exact_match": True},
+            )
+        )
+
+
 def test_atomic_write_no_tmp_leftover(tmp_progress):
     tr = ProgressTracker("task_atomic", tmp_progress)
     asyncio.run(tr.init(total=2, batch_size=1, total_batches=2))
