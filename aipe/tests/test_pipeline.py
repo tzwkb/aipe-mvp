@@ -115,6 +115,93 @@ def test_translate_single_project_language_pair_overrides_hardcoded_english(tmp_
     assert "contraction" not in user_msg
 
 
+def test_confidential_thai_profile_maps_language_and_blocks_web_search(tmp_path):
+    projects = tmp_path / "projects"
+    _write_min_project(
+        projects,
+        "synthetic-th/zh-th",
+        language_pair="ZH-TH",
+        source_lang="zh",
+        target_lang="th",
+        collection="synthetic_th_corpus",
+        allow_web_search=False,
+    )
+    project_resources = ProjectResourceManager(
+        ProjectRegistry(projects_dir=projects, default_project="synthetic-th/zh-th")
+    )
+    rag = FakeRAG(diagnostics=_weak_recall_diag())
+    web = FakeWebSearch(results=_web_results())
+    llm = FakeLLM(response_fn=lambda msgs: "คำแปล")
+    pipe = TranslationPipeline(
+        TerminologyService(),
+        rag,
+        StyleGuideService(),
+        llm,
+        web_search_svc=web,
+        project_resources=project_resources,
+    )
+
+    result = asyncio.run(
+        pipe.translate_single(
+            "合成测试文本",
+            project_id="synthetic-th/zh-th",
+            enable_web_search=True,
+        )
+    )
+
+    system_msg = llm.calls[0][0]["content"]
+    assert "源语言：Chinese" in system_msg
+    assert "目标语言：Thai" in system_msg
+    assert rag.collection_calls == ["synthetic_th_corpus"]
+    assert web.calls == []
+    assert result.web_search_triggered is None
+
+
+def test_confidential_profile_blocks_web_search_for_group_and_dialog(tmp_path):
+    projects = tmp_path / "projects"
+    _write_min_project(
+        projects,
+        "synthetic-th/zh-th",
+        language_pair="ZH-TH",
+        source_lang="zh",
+        target_lang="th",
+        collection="synthetic_th_corpus",
+        allow_web_search=False,
+    )
+    project_resources = ProjectResourceManager(
+        ProjectRegistry(projects_dir=projects, default_project="synthetic-th/zh-th")
+    )
+    web = FakeWebSearch(results=_web_results())
+    llm = FakeLLM(response_fn=lambda msgs: "1. ก\n2. ข")
+    pipe = TranslationPipeline(
+        TerminologyService(),
+        FakeRAG(diagnostics=_weak_recall_diag()),
+        StyleGuideService(),
+        llm,
+        web_search_svc=web,
+        project_resources=project_resources,
+    )
+
+    group = asyncio.run(
+        pipe.translate_group(
+            ["新词A", "新词B"],
+            project_id="synthetic-th/zh-th",
+            enable_web_search=True,
+        )
+    )
+    dialog = asyncio.run(
+        pipe.translate_dialog(
+            ["新词1", "新词2"],
+            ["甲", "乙"],
+            project_id="synthetic-th/zh-th",
+            enable_web_search=True,
+        )
+    )
+
+    assert web.calls == []
+    assert all(result.web_search_triggered is None for result in group + dialog)
+
+
 def test_translate_single_no_term_match_skips_term_section():
     pipe, _, _, llm = _make_pipeline(
         terms=[TermEntry(source="契丹", target="Khitan")],

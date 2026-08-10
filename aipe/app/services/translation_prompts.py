@@ -68,6 +68,7 @@ _LANGUAGE_NAMES = {
     "RU": "Russian",
     "PT": "Portuguese",
     "ES": "Spanish",
+    "TH": "Thai",
 }
 
 

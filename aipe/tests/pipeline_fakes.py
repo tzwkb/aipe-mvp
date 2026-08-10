@@ -201,6 +201,7 @@ def write_min_project(
     source_lang: str,
     target_lang: str,
     collection: str,
+    allow_web_search: bool = True,
 ) -> None:
     project_dir = root / name
     project_dir.mkdir(parents=True)
@@ -213,6 +214,7 @@ def write_min_project(
                 "target_lang": target_lang,
                 "game": "Isekai",
                 "qdrant_collection": collection,
+                "allow_web_search": allow_web_search,
             },
             ensure_ascii=False,
         ),

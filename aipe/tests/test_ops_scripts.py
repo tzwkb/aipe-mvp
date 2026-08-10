@@ -28,6 +28,7 @@ def test_create_project_profile_writes_relative_assets(tmp_path):
         web_search_prefix="Game CN",
         prompt_notes="Keep UI concise.",
         vision_system_prompt="vision prompt",
+        allow_web_search=False,
     )
 
     payload = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -37,6 +38,7 @@ def test_create_project_profile_writes_relative_assets(tmp_path):
     assert payload["style_guide"] == "../../../data/style_guide/guide.md"
     assert payload["terminology"] == "../../../data/terminology/terms.xlsx"
     assert payload["qdrant_collection"] == "game_en_corpus"
+    assert payload["allow_web_search"] is False
     assert payload["prompt_notes"] == "prompt_notes.md"
     assert (profile_path.parent / "prompt_notes.md").read_text(encoding="utf-8") == "Keep UI concise."
 

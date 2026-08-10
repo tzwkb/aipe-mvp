@@ -53,6 +53,7 @@ class _ProjectContext:
     base_system: str
     target_lang: str
     web_search_prefix: str | None
+    allow_web_search: bool
     vision_system_prompt: str | None
 
 
@@ -114,6 +115,7 @@ class TranslationPipeline:
             )
 
         project_ctx = self._resolve_project(project_id, rag_collection)
+        enable_web_search = enable_web_search and project_ctx.allow_web_search
         effective_collection = rag_collection or project_ctx.rag_collection
 
         if use_tm_exact_match:
@@ -267,6 +269,7 @@ class TranslationPipeline:
 
         cleaned = [(s or "").strip() for s in sources]
         project_ctx = self._resolve_project(project_id, rag_collection)
+        enable_web_search = enable_web_search and project_ctx.allow_web_search
         effective_collection = rag_collection or project_ctx.rag_collection
         if not all(cleaned):
             # 出现空串时回退单句（translate_single 会对空串返回 error 结果）
@@ -475,6 +478,7 @@ class TranslationPipeline:
 
         cleaned = [(s or "").strip() for s in sources]
         project_ctx = self._resolve_project(project_id, rag_collection)
+        enable_web_search = enable_web_search and project_ctx.allow_web_search
         effective_collection = rag_collection or project_ctx.rag_collection
         if not all(cleaned):
             # 出现空句时退化为单句路径，translate_single 会对空串返回 error
@@ -653,6 +657,7 @@ class TranslationPipeline:
                 base_system=base_system_for_project(profile, prompt_notes),
                 target_lang=profile.target_lang,
                 web_search_prefix=profile.web_search_prefix,
+                allow_web_search=profile.allow_web_search,
                 vision_system_prompt=profile.vision_system_prompt,
             )
         if project_id and self.project_resources is None:
@@ -664,6 +669,7 @@ class TranslationPipeline:
             base_system=BASE_SYSTEM,
             target_lang="en",
             web_search_prefix=None,
+            allow_web_search=True,
             vision_system_prompt=None,
         )
 

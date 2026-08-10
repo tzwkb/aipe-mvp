@@ -61,6 +61,7 @@ async def collect_report(
             "game": profile.game,
             "qdrant_collection": profile.qdrant_collection,
             "web_search_prefix": profile.web_search_prefix,
+            "allow_web_search": profile.allow_web_search,
             "profile_dir": str(profile.profile_dir),
         },
         "terminology_total": len(manager.terminology(profile.name).entries),
@@ -93,6 +94,7 @@ def print_text_report(report: dict[str, Any]) -> None:
     print(f"game: {project['game']}")
     print(f"collection: {project['qdrant_collection']}")
     print(f"web_search_prefix: {project['web_search_prefix']}")
+    print(f"allow_web_search: {project['allow_web_search']}")
     print(f"terminology_total: {report['terminology_total']}")
     print(
         "style_guide: "
