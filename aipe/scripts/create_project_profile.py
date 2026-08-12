@@ -67,6 +67,7 @@ def create_project_profile(
     web_search_prefix: str | None,
     prompt_notes: str | None,
     vision_system_prompt: str | None,
+    allow_web_search: bool = True,
     force: bool = False,
 ) -> Path:
     project_dir = projects_dir / _safe_project_id(project_id)
@@ -81,13 +82,14 @@ def create_project_profile(
     if not resolved_source_lang or not resolved_target_lang:
         raise ValueError(f"无法从 language_pair/source_lang/target_lang 解析语言对: {language_pair!r}")
     _validate_language_pair_suffix(project_id, resolved_source_lang, resolved_target_lang)
-    payload: dict[str, str] = {
+    payload: dict[str, str | bool] = {
         "name": project_id,
         "language_pair": language_pair,
         "source_lang": resolved_source_lang,
         "target_lang": resolved_target_lang,
         "game": game,
         "background": background,
+        "allow_web_search": allow_web_search,
     }
 
     style_rel = _asset_relative_to_profile(project_dir, style_guide)
@@ -128,6 +130,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--web-search-prefix", default=None)
     parser.add_argument("--prompt-notes", default=None)
     parser.add_argument("--vision-system-prompt", default=None)
+    parser.add_argument(
+        "--disable-web-search",
+        action="store_true",
+        help="Persist allow_web_search=false for confidential projects",
+    )
     parser.add_argument("--force", action="store_true", help="Overwrite existing profile.json")
     return parser.parse_args()
 
@@ -148,6 +155,7 @@ def main() -> int:
         web_search_prefix=args.web_search_prefix,
         prompt_notes=args.prompt_notes,
         vision_system_prompt=args.vision_system_prompt,
+        allow_web_search=not args.disable_web_search,
         force=args.force,
     )
     print(path)

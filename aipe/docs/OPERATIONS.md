@@ -62,6 +62,9 @@ The script writes `data/projects/<game>/<source-target>/profile.json` and stores
 paths relative to the profile directory. It refuses to overwrite an existing
 profile unless `--force` is passed.
 
+For confidential projects, add `--disable-web-search`. The generated profile then
+enforces `allow_web_search=false` even if a request enables Web search.
+
 ## Import SDLTM Incrementally
 
 Dry run first:

@@ -13,6 +13,7 @@
 - [通用约定](#通用约定)
 - [错误处理](#错误处理)
 - [Health — 健康检查](#health--健康检查)
+  - [GET /capabilities — 能力契约](#get-capabilities--能力契约)
 - [Translate — 翻译](#translate--翻译)
   - [POST /translate — 单句/批量翻译](#post-translate--单句批量翻译)
   - [POST /translate/file — 文件上传翻译](#post-translatefile--文件上传翻译)
@@ -24,6 +25,8 @@
 - [RAG — 双语语料库](#rag--双语语料库)
   - [POST /rag/corpus/upload — 上传语料](#post-ragcorpusupload--上传语料)
   - [POST /rag/search — 手动检索测试](#post-ragsearch--手动检索测试)
+- [Web Search — 外部搜索](#web-search--外部搜索)
+  - [POST /web-search — 手动外部搜索](#post-web-search--手动外部搜索)
 - [Style Guide — 风格指南](#style-guide--风格指南)
   - [POST /style-guide/upload — 上传风格指南](#post-style-guideupload--上传风格指南)
   - [GET /style-guide — 查询风格指南](#get-style-guide--查询风格指南)
@@ -118,7 +121,8 @@ http://localhost:8000/api/v1
 {
   "status": "ok",
   "service": "yanyun-ai-translate",
-  "version": "1.0.0"
+  "version": "1.1.0",
+  "capabilities_url": "/api/v1/capabilities"
 }
 ```
 
@@ -126,6 +130,37 @@ http://localhost:8000/api/v1
 
 ```bash
 curl http://localhost:8000/api/v1/health
+```
+
+### GET /capabilities — 能力契约
+
+供集成方在启动时机器校验 AIPE 版本和稳定能力。`schema_version`
+只表示本响应的 JSON 结构版本；各能力的 `version` 表示对应请求/响应
+语义版本。集成方应校验所需能力及其版本，不应仅依赖路由是否存在。
+
+```json
+{
+  "schema_version": "1.0.0",
+  "service": "yanyun-ai-translate",
+  "api_version": "1.1.0",
+  "capabilities": {
+    "scoped_rag": {
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/api/v1/rag/search",
+      "scopes": ["global", "project", "special"],
+      "server_resolved_collection": true,
+      "legacy_unscoped_collection": true
+    },
+    "web_search": {
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/api/v1/web-search",
+      "providers": ["bocha"],
+      "project_aware": true
+    }
+  }
+}
 ```
 
 ---
@@ -310,6 +345,9 @@ curl -o result.csv http://localhost:8000/api/v1/translate/task/a3f2c1b0e9d84f12/
 ## Terminology — 术语表
 
 服务启动时会自动从 `data/terminology/` 目录加载术语表。可通过 API 动态上传追加/更新。
+翻译流水线使用 Unicode 大小写不敏感匹配；术语按 source 长度降序排序，
+同一起点优先最长术语。匹配区间不重叠，同一 source 不区分大小写去重，
+同一术语在一段原文中多次出现也只向 Prompt 注入一次。
 
 ### POST /terminology/upload — 上传术语表
 
@@ -463,7 +501,8 @@ curl -X POST http://localhost:8000/api/v1/rag/corpus/upload \
 
 ### POST /rag/search — 手动检索测试
 
-手动触发 RAG 检索，用于测试语料入库效果。
+手动触发 RAG 检索。不传 `scope` 时保留旧版 `collection` 语义；传入
+`scope` 后必须由服务端解析 collection，请求方不能同时传 `collection`。
 
 **请求体** `application/json`：
 
@@ -472,7 +511,13 @@ curl -X POST http://localhost:8000/api/v1/rag/corpus/upload \
 | `query` | `string` | 是 | — | 检索原文（中文） |
 | `threshold` | `float` | 否 | `0.85` | 相似度阈值，范围 `[0.0, 1.0]` |
 | `top_k` | `integer` | 否 | `3` | 返回最相似前 K 条，范围 `[1, 10]` |
-| `collection` | `string \| null` | 否 | `null` | 指定 Qdrant collection 名 |
+| `collection` | `string \| null` | 否 | `null` | 仅旧版兼容；与 `scope` 互斥 |
+| `scope` | `global \| project \| special \| null` | 否 | `null` | 服务端检索库作用域 |
+| `project_id` | `string \| null` | 否 | `null` | 仅 `scope=project` 时必填 |
+
+`global` 使用 `RAG_GLOBAL_COLLECTION`，`project` 使用项目 profile 的
+`qdrant_collection`，`special` 使用 `RAG_SPECIAL_COLLECTION`。对应配置缺失时
+拒绝检索（fail closed）；响应不返回 collection。
 
 **响应** `200 OK` → [RAGSearchResponse](#ragsearchresponse)
 
@@ -483,6 +528,7 @@ curl -X POST http://localhost:8000/api/v1/rag/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "剑出鞘，天下乱",
+    "scope": "global",
     "threshold": 0.75,
     "top_k": 5
   }'
@@ -491,6 +537,8 @@ curl -X POST http://localhost:8000/api/v1/rag/search \
 ```json
 {
   "query": "剑出鞘，天下乱",
+  "scope": "global",
+  "project_id": null,
   "total": 2,
   "results": [
     {
@@ -508,6 +556,34 @@ curl -X POST http://localhost:8000/api/v1/rag/search \
   ]
 }
 ```
+
+**错误**：`422` 字段组合无效；`404 rag_project_not_found`；
+`400 rag_project_invalid`；`503 rag_scope_not_configured`；`502 rag_upstream_error`。
+
+---
+
+## Web Search — 外部搜索
+
+### POST /web-search — 手动外部搜索
+
+复用 AIPE 现有 Bocha 搜索服务。传 `project_id` 时使用 profile 的
+`web_search_prefix`，且 `allow_web_search=false` 的项目会拒绝请求。
+
+| 字段 | 类型 | 必填 | 默认 | 描述 |
+|------|------|------|------|------|
+| `query` | `string` | 是 | — | 非空搜索文本 |
+| `top_k` | `integer` | 否 | `3` | 范围 `[1, 10]`；返回数仍受服务端 snippet 上限约束 |
+| `project_id` | `string \| null` | 否 | `null` | 项目 profile ID |
+| `provider` | `string` | 否 | `auto` | 当前支持 `auto` / `bocha`；Bing/Google 等返回 `501` |
+
+成功返回 [WebSearchResponse](#websearchresponse)。合法空结果仍返回
+`200`，其中 `total=0` 且 `results=[]`。
+
+**错误**：`403 web_search_forbidden`；`501 web_search_provider_not_supported`；
+`503 web_search_not_configured`；`504 web_search_timeout`；
+`503 web_search_rate_limited`；`502 web_search_upstream_error`；
+`502 web_search_invalid_response`。错误响应为
+`{"detail":{"code":"...","message":"..."}}`，不包含 API key、上游 URL 或上游正文。
 
 ---
 
@@ -622,8 +698,31 @@ curl "http://localhost:8000/api/v1/style-guide?full=true"
 | 字段 | 类型 | 描述 |
 |------|------|------|
 | `query` | `string` | 检索原文 |
+| `scope` | `global \| project \| special \| null` | 作用域；`null` 为旧版模式 |
+| `project_id` | `string \| null` | 项目作用域的 profile ID |
 | `total` | `integer` | 命中总数 |
 | `results` | `RAGSearchResult[]` | 检索结果列表 |
+
+### WebSearchResponse
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| `query` | `string` | 搜索文本 |
+| `provider` | `bocha` | 实际使用的 provider |
+| `project_id` | `string \| null` | 可选项目 profile ID |
+| `total` | `integer` | 结果数 |
+| `results` | `WebSearchResult[]` | 标准化搜索结果 |
+
+### WebSearchResult
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| `title` | `string` | 网页标题 |
+| `snippet` | `string` | 截断后的搜索摘要 |
+| `url` | `string` | 网页 URL |
+| `site_name` | `string \| null` | 站点名 |
+| `image_url` | `string \| null` | 可选图片 URL |
+| `image_analysis` | `string \| null` | 可选图片分析 |
 
 ### CorpusUploadResponse
 
@@ -732,6 +831,8 @@ curl "http://localhost:8000/api/v1/style-guide?full=true"
 | `QDRANT_HOST` | `localhost` | Qdrant 服务地址 |
 | `QDRANT_PORT` | `6333` | Qdrant 服务端口 |
 | `QDRANT_COLLECTION` | `yanyun_corpus` | 默认向量 collection 名称 |
+| `RAG_GLOBAL_COLLECTION` | — | `global` 作用域 collection；留空时拒绝该 scope |
+| `RAG_SPECIAL_COLLECTION` | — | `special` 作用域 collection；留空时拒绝该 scope |
 | `RAG_THRESHOLD` | `0.5` | 全局 RAG 相似度阈值（Dense 路召回阶段） |
 | `RAG_TOP_K` | `3` | 全局 RAG Top-K |
 | `RAG_DENSE_PREFETCH` | `20` | Dense 路送入 RRF 的候选数 |
@@ -743,5 +844,12 @@ curl "http://localhost:8000/api/v1/style-guide?full=true"
 | `CLUSTER_PAIR_THRESHOLD` | `0.4` | 句对前后缀相似度合并阈值（粗筛） |
 | `CLUSTER_MIN_COVERAGE` | `0.5` | 公共前后缀覆盖率门槛（细筛） |
 | `CLUSTER_MAX_GROUP_SIZE` | `10` | 单次整组 LLM 调用最大句数 |
+| `WEB_SEARCH_ENABLED` | `false` | 全局 Web Search 开关 |
+| `BOCHA_API_KEY` | — | Bocha API key；不配置时薄接口返回 503 |
+| `BOCHA_ENDPOINT` | `https://api.bocha.cn/v1/web-search` | Bocha 上游地址 |
+| `BOCHA_TIMEOUT` | `8.0` | 单次上游超时秒数 |
+| `BOCHA_MAX_RETRIES` | `1` | 429 / 5xx 的最大重试次数 |
+| `WEB_SEARCH_MAX_CONCURRENT` | `4` | 上游全局并发上限 |
+| `WEB_SEARCH_MAX_SNIPPETS` | `3` | 服务最多保留的摘要数 |
 | `DATA_DIR` | `./data` | 数据目录（术语表、风格指南自动加载路径） |
 | `PROGRESS_DIR` | `./data/progress` | 批量任务断点续传进度文件目录 |

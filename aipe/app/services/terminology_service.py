@@ -22,18 +22,19 @@ class TerminologyService:
         self.entries: list[TermEntry] = []
         self.term_dict: dict[str, str] = {}
         self.term_categories: dict[str, list[TermEntry]] = {}
+        self._entries_by_fold: dict[str, TermEntry] = {}
         self._pattern: re.Pattern[str] | None = None
         self._duplicate_count: int = 0
 
     # ---------- load ----------
 
     def load(self, entries: list[TermEntry] | list[dict]) -> None:
-        """加载术语条目，按 source 长度降序构建正则，确保长术语优先匹配。
+        """加载术语条目，并构建 Unicode 大小写不敏感的最长优先匹配器。
 
-        重复 source 保留首条，重复计数对外暴露用于上传响应。
+        source 使用 ``casefold`` 去重。候选顺序与输入顺序无关，因此相同数据集
+        始终会选中同一条记录并产生同一匹配顺序。
         """
-        normalized: list[TermEntry] = []
-        seen: set[str] = set()
+        candidates: list[TermEntry] = []
         dup = 0
         for raw in entries:
             entry = raw if isinstance(raw, TermEntry) else TermEntry(**raw)
@@ -41,16 +42,33 @@ class TerminologyService:
             tgt = entry.target.strip()
             if not src or not tgt:
                 continue
-            if src in seen:
+            candidates.append(entry.model_copy(update={"source": src, "target": tgt}))
+
+        candidates.sort(
+            key=lambda entry: (
+                -len(entry.source),
+                entry.source.casefold(),
+                entry.source,
+                entry.target.casefold(),
+                entry.target,
+                entry.category or "",
+                entry.notes or "",
+            )
+        )
+
+        normalized: list[TermEntry] = []
+        seen: set[str] = set()
+        for entry in candidates:
+            key = entry.source.casefold()
+            if key in seen:
                 dup += 1
                 continue
-            seen.add(src)
-            normalized.append(entry.model_copy(update={"source": src, "target": tgt}))
-
-        normalized.sort(key=lambda e: len(e.source), reverse=True)
+            seen.add(key)
+            normalized.append(entry)
 
         self.entries = normalized
         self.term_dict = {e.source: e.target for e in normalized}
+        self._entries_by_fold = {e.source.casefold(): e for e in normalized}
         self.term_categories = {}
         for e in normalized:
             if e.category:
@@ -58,7 +76,8 @@ class TerminologyService:
 
         if normalized:
             self._pattern = re.compile(
-                "|".join(re.escape(e.source) for e in normalized)
+                "|".join(re.escape(e.source) for e in normalized),
+                re.IGNORECASE,
             )
         else:
             self._pattern = None
@@ -84,7 +103,9 @@ class TerminologyService:
     def find_matches(self, text: str) -> list[TermEntry]:
         """扫描原文中命中的术语，按出现顺序去重返回完整条目。
 
-        长术语优先（``load`` 已按长度降序构建正则），同一术语多次出现只返回一次。
+        正则匹配为 Unicode 大小写不敏感，并天然产生不重叠区间。``load``
+        已按长度降序构建正则，因此同一起点优先最长术语；同一术语
+        多次出现只返回一次。
         命中结果会作为"强烈推荐"参考段注入 Prompt，由 LLM 结合语境决定是否采用。
         """
         if not text or self._pattern is None:
@@ -93,11 +114,11 @@ class TerminologyService:
         seen: set[str] = set()
         matches: list[TermEntry] = []
         for m in self._pattern.finditer(text):
-            src = m.group(0)
-            if src in seen:
+            key = m.group(0).casefold()
+            if key in seen:
                 continue
-            seen.add(src)
-            entry = next((e for e in self.entries if e.source == src), None)
+            seen.add(key)
+            entry = self._entries_by_fold.get(key)
             if entry is not None:
                 matches.append(entry)
         return matches
@@ -108,7 +129,8 @@ class TerminologyService:
         return list(self.entries)
 
     def lookup(self, source: str) -> str | None:
-        return self.term_dict.get(source)
+        entry = self._entries_by_fold.get(source.strip().casefold())
+        return entry.target if entry is not None else None
 
 
 # ---------- 模块级单例 ----------
@@ -130,8 +152,8 @@ def reset_terminology_service() -> None:
 
 
 __all__ = [
-    "TerminologyService",
     "TerminologyError",
+    "TerminologyService",
     "get_terminology_service",
     "reset_terminology_service",
 ]

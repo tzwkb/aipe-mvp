@@ -28,6 +28,7 @@ def test_create_project_profile_writes_relative_assets(tmp_path):
         web_search_prefix="Game CN",
         prompt_notes="Keep UI concise.",
         vision_system_prompt="vision prompt",
+        allow_web_search=False,
     )
 
     payload = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -37,6 +38,7 @@ def test_create_project_profile_writes_relative_assets(tmp_path):
     assert payload["style_guide"] == "../../../data/style_guide/guide.md"
     assert payload["terminology"] == "../../../data/terminology/terms.xlsx"
     assert payload["qdrant_collection"] == "game_en_corpus"
+    assert payload["allow_web_search"] is False
     assert payload["prompt_notes"] == "prompt_notes.md"
     assert (profile_path.parent / "prompt_notes.md").read_text(encoding="utf-8") == "Keep UI concise."
 
@@ -171,6 +173,54 @@ def test_batch_translate_allows_explicit_collection_override():
 
     assert params["rag_collection"] == "custom_corpus"
     assert params["use_tm_exact_match"] == "true"
+
+
+def test_batch_translate_recursive_jobs_are_unique_for_duplicate_stems(tmp_path):
+    from scripts.batch_translate_files import build_file_job
+
+    src_dir = tmp_path / "input"
+    out_dir = tmp_path / "output"
+    first = src_dir / "chapter_a" / "dialog.xlsx"
+    second = src_dir / "chapter_b" / "dialog.xlsx"
+
+    first_task, first_output = build_file_job(
+        first,
+        src_dir=src_dir,
+        out_dir=out_dir,
+        task_prefix="run_",
+        recursive=True,
+    )
+    second_task, second_output = build_file_job(
+        second,
+        src_dir=src_dir,
+        out_dir=out_dir,
+        task_prefix="run_",
+        recursive=True,
+    )
+
+    assert first_task != second_task
+    assert first_output != second_output
+    assert first_task.startswith("run_chapter_a__dialog-")
+    assert second_task.startswith("run_chapter_b__dialog-")
+    assert first_output == out_dir / f"{first_task}.csv"
+    assert second_output == out_dir / f"{second_task}.csv"
+
+
+def test_batch_translate_non_recursive_job_keeps_legacy_task_id(tmp_path):
+    from scripts.batch_translate_files import build_file_job
+
+    src_dir = tmp_path / "input"
+    out_dir = tmp_path / "output"
+    task_id, out_path = build_file_job(
+        src_dir / "dialog.xlsx",
+        src_dir=src_dir,
+        out_dir=out_dir,
+        task_prefix="run_",
+        recursive=False,
+    )
+
+    assert task_id == "run_dialog"
+    assert out_path == out_dir / "run_dialog.csv"
 
 
 def test_verify_stack_builds_health_url():

@@ -31,6 +31,8 @@ class Settings(BaseSettings):
 
     # RAG (hybrid: dense + BM25 + RRF)
     # rag_threshold 仅作用在 dense 路召回（RRF 融合分与 cosine 不可比，故不在融合后过滤）。
+    rag_global_collection: str | None = None
+    rag_special_collection: str | None = None
     rag_threshold: float = 0.5
     rag_top_k: int = 3
     rag_dense_prefetch: int = 20    # dense 召回送入 RRF 的候选数
@@ -59,6 +61,7 @@ class Settings(BaseSettings):
     bocha_summary: bool = True
     bocha_timeout: float = 8.0
     bocha_max_retries: int = 1
+    web_search_max_concurrent: int = 4
     web_search_dense_threshold: float = 0.6   # dense top1 < 该值才视为弱召回
     web_search_max_snippets: int = 3          # 注入 prompt 的 snippet 上限
     web_search_snippet_max_chars: int = 300   # 单条 snippet 截断长度

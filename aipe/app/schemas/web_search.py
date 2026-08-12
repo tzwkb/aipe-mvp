@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+from pydantic_core import PydanticCustomError
 
 
 class WebSearchResult(BaseModel):
@@ -26,4 +29,27 @@ class WebSearchResult(BaseModel):
     )
 
 
-__all__ = ["WebSearchResult"]
+class WebSearchRequest(BaseModel):
+    query: str = Field(..., description="搜索关键词")
+    top_k: int = Field(3, ge=1, le=10, description="最多返回结果数")
+    project_id: str | None = Field(None, description="可选项目 profile ID")
+    provider: str = Field("auto", description="当前支持 auto / bocha")
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise PydanticCustomError("web_search_query_empty", "query 不能为空")
+        return value
+
+
+class WebSearchResponse(BaseModel):
+    query: str
+    provider: Literal["bocha"] = "bocha"
+    project_id: str | None = None
+    total: int
+    results: list[WebSearchResult]
+
+
+__all__ = ["WebSearchRequest", "WebSearchResponse", "WebSearchResult"]

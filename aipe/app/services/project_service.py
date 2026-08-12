@@ -32,6 +32,7 @@ class ProjectProfile:
     profile_dir: Path
     qdrant_collection: str | None = None
     web_search_prefix: str | None = None
+    allow_web_search: bool = True
     background: str = ""
     style_guide_path: Path | None = None
     terminology_path: Path | None = None
@@ -152,6 +153,12 @@ class ProjectRegistry:
         if not language_pair and source_lang and target_lang:
             language_pair = f"{source_lang.upper()}-{target_lang.upper()}"
 
+        allow_web_search = raw.get("allow_web_search", True)
+        if not isinstance(allow_web_search, bool):
+            raise ProjectProfileError(
+                f"project profile allow_web_search 必须是布尔值: {profile_path}"
+            )
+
         profile = ProjectProfile(
             name=name,
             language_pair=language_pair,
@@ -161,6 +168,7 @@ class ProjectRegistry:
             profile_dir=profile_dir,
             qdrant_collection=(str(raw["qdrant_collection"]).strip() if raw.get("qdrant_collection") else None),
             web_search_prefix=(str(raw["web_search_prefix"]).strip() if raw.get("web_search_prefix") else None),
+            allow_web_search=allow_web_search,
             background=str(raw.get("background") or "").strip(),
             style_guide_path=_resolve_asset(profile_dir, raw.get("style_guide")),
             terminology_path=_resolve_asset(profile_dir, raw.get("terminology")),

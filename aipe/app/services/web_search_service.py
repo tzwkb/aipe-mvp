@@ -1,18 +1,12 @@
-"""博查（Bocha）Web 搜索服务：RAG 弱召回兜底用的外部上下文补充。
+"""博查（Bocha）Web 搜索服务。
 
 仅在以下场景作为最低优先级参考段注入 prompt：
 - 术语库 0 命中
 - RAG dense top1 < 阈值
 - RAG sparse 命中数 = 0
 
-设计要点：
-- 异步 httpx 客户端；429/5xx 线性退避重试；网络错误 / 4xx 直接静默降级返回空
-- 本地文件缓存：``data/cache/web_search/{md5(query)}.json``，``tmp.replace`` 原子写
-- 进程内 in-flight 去重（同 query 并发只发 1 次 HTTP）
-- 4xx（如 401 失效密钥）后进程内禁用，避免雪崩
-
-失败模式：所有失败 (网络 / 4xx / 5xx / 解析) 都返回 ``[]``，由 pipeline 决定是否
-继续翻译；本服务永远不抛异常给上层。
+``search`` 保留翻译流水线的静默降级语义；``search_strict`` 为 API 调用方
+提供可区分的失败诊断。两个入口共用缓存、in-flight 去重和 Bocha 解析。
 """
 
 from __future__ import annotations
@@ -36,10 +30,42 @@ logger = logging.getLogger(__name__)
 _CACHE_VERSION = 1
 
 
-def _cache_key(query: str) -> str:
-    """归一化空白 + 大小写后取 md5；保证 ``  少侠 ``、``少侠`` 命中同一缓存。"""
-    norm = " ".join(query.strip().split()).lower()
-    return hashlib.md5(norm.encode("utf-8")).hexdigest()
+class WebSearchFailure(RuntimeError):
+    code = "web_search_upstream_error"
+
+
+class WebSearchNotConfigured(WebSearchFailure):
+    code = "web_search_not_configured"
+
+
+class WebSearchTimeout(WebSearchFailure):
+    code = "web_search_timeout"
+
+
+class WebSearchRateLimited(WebSearchFailure):
+    code = "web_search_rate_limited"
+
+
+class WebSearchUpstreamError(WebSearchFailure):
+    code = "web_search_upstream_error"
+
+
+class WebSearchInvalidResponse(WebSearchFailure):
+    code = "web_search_invalid_response"
+
+
+def _cache_key(
+    query: str,
+    *,
+    prefix: str | None = None,
+    provider: str = "bocha",
+) -> str:
+    """缓存键显式隔离 provider / prefix / query，并归一化空白和大小写。"""
+    norm_query = " ".join(query.strip().split()).lower()
+    norm_prefix = " ".join((prefix or "").strip().split()).lower()
+    norm_provider = provider.strip().lower()
+    raw = f"{norm_provider}\n{norm_prefix}\n{norm_query}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
 def _now_iso() -> str:
@@ -56,6 +82,7 @@ class WebSearchService:
         self.summary = settings.bocha_summary
         self.timeout = settings.bocha_timeout
         self.max_retries = settings.bocha_max_retries
+        self.max_concurrent = max(1, settings.web_search_max_concurrent)
         self.max_snippets = settings.web_search_max_snippets
         self.snippet_max_chars = settings.web_search_snippet_max_chars
         self.cache_enabled = settings.web_search_cache_enabled
@@ -75,6 +102,7 @@ class WebSearchService:
             httpx.AsyncClient(timeout=self.timeout) if self.enabled else None
         )
         self._inflight: dict[str, asyncio.Task[list[WebSearchResult]]] = {}
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
 
         if not self.enabled:
             if settings.web_search_enabled and not settings.bocha_api_key:
@@ -85,30 +113,49 @@ class WebSearchService:
     # ---------- 对外入口 ----------
 
     async def search(self, query: str, *, prefix: str | None = None) -> list[WebSearchResult]:
-        """主入口：缓存命中直接返回；否则发实网；同 query 并发去重。
+        """翻译流水线兼容入口：所有搜索失败都静默降级为空列表。"""
+        try:
+            return await self.search_strict(query, prefix=prefix)
+        except WebSearchNotConfigured:
+            return []
+        except WebSearchFailure as exc:
+            logger.warning("web search 静默降级 code=%s", exc.code)
+            return []
 
-        永远不抛异常（任何失败都返回空列表）。
-        """
-        if not self.enabled or not query or not query.strip():
+    async def search_strict(
+        self,
+        query: str,
+        *,
+        prefix: str | None = None,
+        limit: int | None = None,
+        provider: str = "bocha",
+    ) -> list[WebSearchResult]:
+        """API 入口：网络和响应失败使用可区分的异常类型。"""
+        if not self.enabled:
+            raise WebSearchNotConfigured("web search is not configured")
+        if not query or not query.strip():
             return []
 
         query_combined = f"{prefix.strip()} {query}".strip() if prefix and prefix.strip() else query
-        key = _cache_key(query_combined)
+        key = _cache_key(query, prefix=prefix, provider=provider)
+        result_limit = self.max_snippets if limit is None else min(limit, self.max_snippets)
 
         cached = self._read_cache(key)
         if cached is not None:
-            logger.debug("web_search cache hit key=%s query=%r", key, query[:30])
-            return cached
+            logger.debug("web_search cache hit key=%s", key)
+            return cached[:result_limit]
 
         # in-flight dedupe：同一 query 进程内并发只发 1 次
         existing = self._inflight.get(key)
         if existing is not None:
-            return await existing
+            return (await existing)[:result_limit]
 
-        task = asyncio.create_task(self._do_search(query, key, query_combined=query_combined))
+        task = asyncio.create_task(
+            self._do_search_strict(key, query_combined=query_combined, cache_query=query)
+        )
         self._inflight[key] = task
         try:
-            return await task
+            return (await task)[:result_limit]
         finally:
             self._inflight.pop(key, None)
 
@@ -118,9 +165,14 @@ class WebSearchService:
 
     # ---------- 实际执行 ----------
 
-    async def _do_search(self, query: str, key: str, *, query_combined: str | None = None) -> list[WebSearchResult]:
+    async def _do_search_strict(
+        self,
+        key: str,
+        *,
+        query_combined: str,
+        cache_query: str,
+    ) -> list[WebSearchResult]:
         assert self._client is not None  # enabled=True 时 client 必有
-        query_combined = query_combined or query
         payload = {"query": query_combined, "summary": self.summary, "count": self.count}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -129,14 +181,16 @@ class WebSearchService:
 
         attempts = max(1, self.max_retries + 1)
         last_status: int | None = None
-        last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                resp = await self._client.post(self.endpoint, json=payload, headers=headers)
+                async with self._semaphore:
+                    resp = await self._client.post(self.endpoint, json=payload, headers=headers)
+            except httpx.TimeoutException as exc:
+                logger.warning("bocha 请求失败 code=web_search_timeout")
+                raise WebSearchTimeout("web search timed out") from exc
             except httpx.RequestError as exc:
-                last_exc = exc
-                logger.warning("bocha 请求异常 query=%r attempt=%d/%d: %s", query[:30], attempt, attempts, exc)
-                break  # 网络错误不重试，直接降级
+                logger.warning("bocha 请求失败 code=web_search_upstream_error")
+                raise WebSearchUpstreamError("web search transport failed") from exc
 
             status = resp.status_code
             last_status = status
@@ -144,61 +198,89 @@ class WebSearchService:
                 try:
                     body = resp.json()
                 except ValueError as exc:
-                    logger.warning("bocha 响应非 JSON query=%r: %s", query[:30], exc)
-                    return []
-                results = self._parse_response(body)
+                    logger.warning("bocha 响应失败 code=web_search_invalid_response")
+                    raise WebSearchInvalidResponse("web search returned invalid JSON") from exc
+                results = self._parse_response_strict(body)
                 if self.cache_enabled:
-                    self._write_cache(key, results, query=query)
-                logger.info(
-                    "web_search cache miss key=%s query=%r n=%d", key, query[:30], len(results)
-                )
+                    self._write_cache(key, results, query=cache_query)
+                logger.info("web_search cache miss key=%s n=%d", key, len(results))
                 return results
 
             # 4xx（非 429）→ 进程内禁用，避免无效轮询
             if 400 <= status < 500 and status != 429:
                 logger.error(
-                    "bocha 4xx query=%r status=%d body=%s；进程内禁用 web search",
-                    query[:30],
+                    "bocha 请求失败 status=%d code=web_search_upstream_error；"
+                    "进程内禁用 web search",
                     status,
-                    resp.text[:200],
                 )
                 self.enabled = False
-                return []
+                raise WebSearchUpstreamError("web search upstream rejected the request")
 
             # 429 / 5xx → 线性退避重试
-            if attempt < attempts:
+            if (status == 429 or 500 <= status < 600) and attempt < attempts:
                 backoff = 1.0 * attempt
                 logger.warning(
-                    "bocha %d query=%r attempt=%d/%d, 退避 %.1fs",
+                    "bocha 请求失败 status=%d attempt=%d/%d，退避 %.1fs",
                     status,
-                    query[:30],
                     attempt,
                     attempts,
                     backoff,
                 )
                 await asyncio.sleep(backoff)
+                continue
 
-        logger.warning(
-            "bocha 最终失败 query=%r last_status=%s last_exc=%s",
-            query[:30],
-            last_status,
-            last_exc,
-        )
-        return []
+            if status == 429:
+                raise WebSearchRateLimited("web search rate limited")
+            raise WebSearchUpstreamError("web search upstream failed")
+
+        if last_status == 429:
+            raise WebSearchRateLimited("web search rate limited")
+        raise WebSearchUpstreamError("web search upstream failed")
 
     # ---------- 响应解析 ----------
 
-    def _parse_response(self, body: dict) -> list[WebSearchResult]:
-        data = body.get("data") or {}
-        pages = ((data.get("webPages") or {}).get("value")) or []
-        imgs = ((data.get("images") or {}).get("value")) or []
+    def _parse_response_strict(self, body: object) -> list[WebSearchResult]:
+        if not isinstance(body, dict):
+            raise WebSearchInvalidResponse("web search response must be an object")
+        code = body.get("code")
+        if not isinstance(code, int):
+            raise WebSearchInvalidResponse("web search response code is invalid")
+        if code != 200:
+            raise WebSearchUpstreamError("web search upstream returned an error")
+
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise WebSearchInvalidResponse("web search response data is invalid")
+        web_pages = data.get("webPages")
+        if not isinstance(web_pages, dict) or not isinstance(web_pages.get("value"), list):
+            raise WebSearchInvalidResponse("web search response pages are invalid")
+        pages = web_pages["value"]
+
+        image_section = data.get("images")
+        imgs: list[object] = []
+        if image_section is not None:
+            if not isinstance(image_section, dict) or not isinstance(image_section.get("value"), list):
+                raise WebSearchInvalidResponse("web search response images are invalid")
+            imgs = image_section["value"]
+
         top_image: str | None = None
         if imgs:
-            first_img = imgs[0] or {}
-            top_image = first_img.get("contentUrl") or first_img.get("thumbnailUrl")
+            first_img = imgs[0]
+            if not isinstance(first_img, dict):
+                raise WebSearchInvalidResponse("web search image item is invalid")
+            image_value = first_img.get("contentUrl") or first_img.get("thumbnailUrl")
+            if image_value is not None and not isinstance(image_value, str):
+                raise WebSearchInvalidResponse("web search image URL is invalid")
+            top_image = image_value
 
         results: list[WebSearchResult] = []
         for i, p in enumerate(pages[: self.max_snippets]):
+            if not isinstance(p, dict):
+                raise WebSearchInvalidResponse("web search result item is invalid")
+            for field in ("name", "url", "summary", "snippet", "siteName"):
+                value = p.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise WebSearchInvalidResponse(f"web search result {field} is invalid")
             raw_snippet = (p.get("summary") or p.get("snippet") or "").strip()
             snippet = raw_snippet[: self.snippet_max_chars]
             results.append(
@@ -227,8 +309,8 @@ class WebSearchService:
             raw = json.loads(path.read_text(encoding="utf-8"))
             payload = raw.get("results") or []
             return [WebSearchResult(**r) for r in payload]
-        except (OSError, json.JSONDecodeError, ValidationError, TypeError) as exc:
-            logger.warning("web search 缓存损坏 %s: %s（视为 miss）", path, exc)
+        except (OSError, json.JSONDecodeError, ValidationError, TypeError):
+            logger.warning("web search 缓存无效 key=%s（视为 miss）", key)
             return None
 
     def _write_cache(self, key: str, results: list[WebSearchResult], *, query: str) -> None:
@@ -249,4 +331,12 @@ class WebSearchService:
             logger.warning("web search 写缓存失败 %s: %s（忽略）", path, exc)
 
 
-__all__ = ["WebSearchService"]
+__all__ = [
+    "WebSearchFailure",
+    "WebSearchInvalidResponse",
+    "WebSearchNotConfigured",
+    "WebSearchRateLimited",
+    "WebSearchService",
+    "WebSearchTimeout",
+    "WebSearchUpstreamError",
+]

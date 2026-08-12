@@ -46,6 +46,36 @@ class ContentType(str, Enum):
     UNKNOWN = "未知"
 
 
+class ContentTypeMode(str, Enum):
+    FUNCTIONAL = "functional"
+    CONTEXTUAL = "contextual"
+    NEUTRAL = "neutral"
+
+
+_CONTENT_TYPE_MODES: dict[ContentType, ContentTypeMode] = {
+    ContentType.UI: ContentTypeMode.FUNCTIONAL,
+    ContentType.QUEST: ContentTypeMode.FUNCTIONAL,
+    ContentType.QUEST_OBJECTIVE: ContentTypeMode.FUNCTIONAL,
+    ContentType.ACHIEVEMENT: ContentTypeMode.FUNCTIONAL,
+    ContentType.SKILL: ContentTypeMode.FUNCTIONAL,
+    ContentType.HINT: ContentTypeMode.FUNCTIONAL,
+    ContentType.NOTIFICATION: ContentTypeMode.FUNCTIONAL,
+    ContentType.ITEM: ContentTypeMode.FUNCTIONAL,
+    ContentType.ENTITY: ContentTypeMode.FUNCTIONAL,
+    ContentType.PRESCRIPTION: ContentTypeMode.FUNCTIONAL,
+    ContentType.STORY: ContentTypeMode.CONTEXTUAL,
+    ContentType.QUEST_DESCRIPTION: ContentTypeMode.CONTEXTUAL,
+    ContentType.SPEECH: ContentTypeMode.CONTEXTUAL,
+    ContentType.MARTIAL_RECORDS: ContentTypeMode.CONTEXTUAL,
+    ContentType.APPEARANCE_DESCRIPTION: ContentTypeMode.CONTEXTUAL,
+    ContentType.BESTIARY: ContentTypeMode.CONTEXTUAL,
+}
+
+
+def content_type_mode(content_type: ContentType) -> ContentTypeMode:
+    return _CONTENT_TYPE_MODES.get(content_type, ContentTypeMode.NEUTRAL)
+
+
 _TYPE_DESCRIPTIONS: dict[str, str] = {
     "UI文本": "界面按钮、菜单项、标签等极短文本（通常1-5个词）",
     "剧情": "故事叙述、角色对话、章节标题",

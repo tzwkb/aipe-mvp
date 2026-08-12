@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """批量翻译目录下的 Excel 文件，并把结果导出为 CSV。
 
-逐个文件调用 POST /api/v1/translate/file 翻译（task_id = 文件名去掉扩展名），
+逐个文件调用 POST /api/v1/translate/file 翻译（非递归时 task_id = 文件名去掉扩展名），
 再用接口返回的完整结果按 /translate/task/{task_id}/csv 的列格式写出
 CSV 到输出目录。
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -82,6 +83,31 @@ def discover_xlsx_files(src_dir: Path, *, recursive: bool = False) -> list[Path]
     return sorted(
         p for p in src_dir.glob(pattern) if p.is_file() and not p.name.startswith("~$")
     )
+
+
+def build_file_job(
+    path: Path,
+    *,
+    src_dir: Path,
+    out_dir: Path,
+    task_prefix: str = "",
+    recursive: bool = False,
+) -> tuple[str, Path]:
+    """Return a stable task ID and output path for one input workbook."""
+    if not recursive:
+        task_id = f"{task_prefix}{path.stem}"
+        return task_id, out_dir / f"{task_id}.csv"
+
+    relative_path = path.relative_to(src_dir)
+    relative_stem = relative_path.with_suffix("").as_posix().replace("/", "__")
+    readable = "".join(
+        char if char.isalnum() or char in "._-" else "_"
+        for char in f"{task_prefix}{relative_stem}"
+    )
+    digest = hashlib.sha256(relative_path.as_posix().encode("utf-8")).hexdigest()[:8]
+    readable = readable[:111].rstrip("._-") or "task"
+    task_id = f"{readable}-{digest}"
+    return task_id, out_dir / f"{task_id}.csv"
 
 
 def write_csv(resp: dict, out_path: Path) -> None:
@@ -196,8 +222,13 @@ def main() -> int:
 
     ok, skipped, failed = 0, 0, 0
     for i, path in enumerate(xlsx_files, 1):
-        task_id = f"{args.task_prefix}{path.stem}"  # 文件名（去扩展名）作为 task_id
-        out_path = out_dir / f"{task_id}.csv"
+        task_id, out_path = build_file_job(
+            path,
+            src_dir=src_dir,
+            out_dir=out_dir,
+            task_prefix=args.task_prefix,
+            recursive=args.recursive,
+        )
         prefix = f"[{i}/{len(xlsx_files)}] {path.name}"
 
         if out_path.exists() and not args.overwrite:

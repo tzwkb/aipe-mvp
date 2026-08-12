@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from app.api.router import api_router
 from app.config import get_settings
 from app.errors import TranslationError
+from app.schemas.capabilities import API_VERSION
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +35,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="燕云十六声 AI 翻译 MVP",
     description="基于 FastAPI 的中→英游戏本地化翻译服务（术语+RAG+风格指南）",
-    version="1.0.0",
+    version=API_VERSION,
     lifespan=lifespan,
 )
 

@@ -4,12 +4,18 @@ import logging
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 
+from app.config import Settings, get_settings
 from app.errors import TranslationError
 from app.schemas.rag import (
     CorpusEntry,
     CorpusUploadResponse,
     RAGSearchRequest,
     RAGSearchResponse,
+)
+from app.services.project_service import (
+    ProjectProfileError,
+    ProjectResourceManager,
+    get_project_resource_manager,
 )
 from app.services.rag_service import RAGService, get_rag_service
 from app.utils.file_parser import CorpusParseError, parse_corpus_bytes
@@ -80,14 +86,68 @@ async def upload_corpus(
 async def search(
     req: RAGSearchRequest,
     svc: RAGService = Depends(get_rag_service),
+    settings: Settings = Depends(get_settings),
+    projects: ProjectResourceManager = Depends(get_project_resource_manager),
 ) -> RAGSearchResponse:
+    collection = req.collection
+    if req.scope == "global":
+        collection = (settings.rag_global_collection or "").strip()
+        if not collection:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "rag_scope_not_configured",
+                    "message": "global RAG 作用域未配置",
+                },
+            )
+    elif req.scope == "special":
+        collection = (settings.rag_special_collection or "").strip()
+        if not collection:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "rag_scope_not_configured",
+                    "message": "special RAG 作用域未配置",
+                },
+            )
+    elif req.scope == "project":
+        try:
+            profile = projects.profile(req.project_id)
+        except ProjectProfileError as exc:
+            is_not_found = "not found" in str(exc).lower()
+            raise HTTPException(
+                status_code=(status.HTTP_404_NOT_FOUND if is_not_found else status.HTTP_400_BAD_REQUEST),
+                detail={
+                    "code": "rag_project_not_found" if is_not_found else "rag_project_invalid",
+                    "message": "RAG 项目不存在" if is_not_found else "RAG 项目配置无效",
+                },
+            ) from exc
+        collection = (profile.qdrant_collection or "").strip()
+        if not collection:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "rag_project_invalid",
+                    "message": "RAG 项目未配置 collection",
+                },
+            )
+
     try:
         results = await svc.search(
             req.query,
             threshold=req.threshold,
             top_k=req.top_k,
-            collection=req.collection,
+            collection=collection,
         )
     except TranslationError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return RAGSearchResponse(query=req.query, total=len(results), results=results)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "rag_upstream_error", "message": "RAG 检索失败"},
+        ) from exc
+    return RAGSearchResponse(
+        query=req.query,
+        scope=req.scope,
+        project_id=req.project_id,
+        total=len(results),
+        results=results,
+    )

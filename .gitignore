@@ -26,3 +26,8 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# local tooling / generated outputs
+.codex-work/
+.playwright-cli/
+outputs/

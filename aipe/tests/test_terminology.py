@@ -145,6 +145,37 @@ def test_find_matches_returns_full_entry_with_category():
     assert matches[0].category == "地名"
 
 
+def test_find_matches_is_unicode_case_insensitive_and_deduplicated():
+    svc = TerminologyService()
+    svc.load(
+        [
+            TermEntry(source="Äther", target="Aether"),
+            TermEntry(source="äTHER", target="duplicate"),
+        ]
+    )
+
+    assert svc.duplicate_count == 1
+    assert [match.source for match in svc.find_matches("äTHER 与 Äther")] == ["Äther"]
+    assert svc.lookup("äther") == "Aether"
+
+
+def test_find_matches_is_longest_first_non_overlapping_and_stable():
+    rows = [
+        TermEntry(source="Skill", target="Short"),
+        TermEntry(source="Skill Tree", target="Long"),
+        TermEntry(source="skill", target="Duplicate"),
+    ]
+    first = TerminologyService()
+    second = TerminologyService()
+    first.load(rows)
+    second.load(list(reversed(rows)))
+
+    text = "SKILL TREE then skill then SKILL TREE"
+    assert [match.source for match in first.find_matches(text)] == ["Skill Tree", "Skill"]
+    assert first.to_entries() == second.to_entries()
+    assert first.find_matches(text) == second.find_matches(text)
+
+
 # ---------- API ----------
 
 
