@@ -6,7 +6,7 @@
 
 [English](README.md) | 中文
 
-《燕云十六声》中译英游戏本地化 AI 翻译服务。FastAPI + Qdrant 向量检索 + LLM，带术语库、风格指南、RAG 召回和 Web 搜索兜底。
+面向多项目、多语言对的游戏本地化 AI 翻译服务。FastAPI + Qdrant 向量检索 + LLM，带术语库、风格指南、RAG 召回和 Web 搜索兜底；燕云十六声中译英是当前支持的应用场景之一。
 
 ## 能力
 

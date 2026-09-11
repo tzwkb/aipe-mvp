@@ -8,7 +8,7 @@ English | [中文](README_ZH.md)
 
 ## Overview
 
- ZH-to-EN game-localization translation service for Where Winds Meet, built with FastAPI, Qdrant, terminology, style guides, and RAG retrieval.
+ Multi-project, multilingual game-localization translation service built with FastAPI, Qdrant, terminology, style guides, and RAG retrieval. Where Winds Meet ZH-to-EN is one supported use case.
 
 ## Key Capabilities
 
