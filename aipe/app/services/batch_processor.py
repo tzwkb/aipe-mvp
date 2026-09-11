@@ -52,6 +52,11 @@ class WorkUnit:
     speakers: list[str | None] | None = None
     times: list[float | None] | None = None
     dialog_id: str | None = None
+    addressees: list[str | None] | None = None
+    scene_ids: list[str | None] | None = None
+    relationship_stages: list[str | None] | None = None
+    scene_tones: list[str | None] | None = None
+    context_notes: list[str | None] | None = None
 
 
 class BatchProcessor:
@@ -81,6 +86,11 @@ class BatchProcessor:
         dialog_ids: list[str | None] | None = None,
         speakers: list[str | None] | None = None,
         times: list[float | None] | None = None,
+        addressees: list[str | None] | None = None,
+        scene_ids: list[str | None] | None = None,
+        relationship_stages: list[str | None] | None = None,
+        scene_tones: list[str | None] | None = None,
+        context_notes: list[str | None] | None = None,
         dialog_mode: bool = False,
         enable_web_search: bool = False,
         web_search_dense_threshold: float | None = None,
@@ -93,11 +103,12 @@ class BatchProcessor:
 
         ``dialog_mode=True`` 启用对话路径：按 ``dialog_id`` 聚合并按 ``time`` 排序，
         整段对话一次 LLM 调用；**跳过去重和结构聚类**——同一句话在不同对话语境里译法
-        可能不同，且对话中相邻句子的结构相似性是巧合，不应强制套同句式。无 ``dialog_id``
-        或单条对话退化为 single unit 走 ``translate_single``。
+        可能不同，且对话中相邻句子的结构相似性是巧合，不应强制套同句式。无
+        ``dialog_id`` 的行走 single unit；单条对话由 ``translate_dialog`` 保留元数据后
+        委托给 ``translate_single``。
 
-        ``content_types`` / ``dialog_ids`` / ``speakers`` / ``times`` 均与 ``texts``
-        一一对应，传入非空值时直接复用。
+        ``content_types`` 及全部对话上下文字段均与 ``texts`` 一一对应，传入非空值时
+        直接复用。单行对话仍经 ``translate_dialog`` 进入单句路径，以保留人物与场景元数据。
         """
         bs = batch_size or self.batch_size
         effective_project_id = project_id or self.settings.default_project
@@ -113,9 +124,24 @@ class BatchProcessor:
             d_ids = dialog_ids or [None] * total_orig
             d_speakers = speakers or [None] * total_orig
             d_times = times or [None] * total_orig
-            if len(d_ids) != total_orig or len(d_speakers) != total_orig or len(d_times) != total_orig:
+            d_addressees = addressees or [None] * total_orig
+            d_scene_ids = scene_ids or [None] * total_orig
+            d_relationship_stages = relationship_stages or [None] * total_orig
+            d_scene_tones = scene_tones or [None] * total_orig
+            d_context_notes = context_notes or [None] * total_orig
+            parallel_fields = {
+                "dialog_ids": d_ids,
+                "speakers": d_speakers,
+                "times": d_times,
+                "addressees": d_addressees,
+                "scene_ids": d_scene_ids,
+                "relationship_stages": d_relationship_stages,
+                "scene_tones": d_scene_tones,
+                "context_notes": d_context_notes,
+            }
+            if any(len(values) != total_orig for values in parallel_fields.values()):
                 raise ValueError(
-                    "dialog_mode 下 dialog_ids / speakers / times 长度必须与 texts 一致"
+                    "dialog_mode 下所有对话上下文字段长度必须与 texts 一致"
                 )
 
             # 对话模式跳过去重：dialog 上下文影响译法，强制 1:1 映射
@@ -124,7 +150,16 @@ class BatchProcessor:
             orig_to_unique = list(range(total_orig))
 
             units = self._build_dialog_units(
-                unique_texts, d_ids, d_speakers, d_times, batch_size=bs
+                unique_texts,
+                d_ids,
+                d_speakers,
+                d_times,
+                d_addressees,
+                d_scene_ids,
+                d_relationship_stages,
+                d_scene_tones,
+                d_context_notes,
+                batch_size=bs,
             )
             total_unique = len(unique_texts)
             n_dialog = sum(1 for u in units if u.kind == "dialog")
@@ -230,6 +265,11 @@ class BatchProcessor:
                         speakers=unit.speakers or [None] * len(sources),
                         times=unit.times,
                         dialog_id=unit.dialog_id,
+                        addressees=unit.addressees,
+                        scene_ids=unit.scene_ids,
+                        relationship_stages=unit.relationship_stages,
+                        scene_tones=unit.scene_tones,
+                        context_notes=unit.context_notes,
                         enable_rag=enable_rag,
                         rag_threshold=rag_threshold,
                         rag_top_k=rag_top_k,
@@ -254,6 +294,12 @@ class BatchProcessor:
                         enable_vision=enable_vision,
                         project_id=effective_project_id,
                         use_tm_exact_match=use_tm_exact_match,
+                        speakers=unit.speakers,
+                        addressees=unit.addressees,
+                        scene_ids=unit.scene_ids,
+                        relationship_stages=unit.relationship_stages,
+                        scene_tones=unit.scene_tones,
+                        context_notes=unit.context_notes,
                     )
                 await tracker.save_batch(
                     idx, [r.model_dump(mode="json") for r in results]
@@ -352,14 +398,21 @@ class BatchProcessor:
         dialog_ids: list[str | None],
         speakers: list[str | None],
         times: list[float | None],
+        addressees: list[str | None],
+        scene_ids: list[str | None],
+        relationship_stages: list[str | None],
+        scene_tones: list[str | None],
+        context_notes: list[str | None],
         *,
         batch_size: int,
     ) -> list[WorkUnit]:
         """按 ``dialog_id`` 聚合并按 ``time`` 排序，构造 dialog units。
 
-        - 无 ``dialog_id`` 或单条对话 → 走 single unit（按 ``batch_size`` 切片）
-        - 多条对话 → 每个 dialog_id 一个 dialog unit，按 ``time`` 升序排列（None 视为
+        - 有 ``dialog_id`` → 每个 dialog_id 一个 dialog unit；单条 dialog 会由 pipeline
+          内部委托给单句翻译，但仍保留人物、关系和场景元数据
+        - 多条对话按 ``time`` 升序排列（None 视为
           最早，稳定排序保持原始相对顺序）
+        - 无 ``dialog_id`` → 走 single unit，并保留该行可用的上下文字段
         - 输出顺序：dialog units 在前，散句 single units 在后
         """
         if not texts:
@@ -381,10 +434,6 @@ class BatchProcessor:
         units: list[WorkUnit] = []
         for did in first_seen_order:
             idxs = grouped[did]
-            if len(idxs) == 1:
-                # 单条对话退化为散句，避免单条 dialog unit 浪费上下文 prompt
-                orphans.extend(idxs)
-                continue
             idxs_sorted = sorted(
                 idxs,
                 key=lambda i: (
@@ -395,6 +444,11 @@ class BatchProcessor:
             )
             unit_speakers = [speakers[i] for i in idxs_sorted]
             unit_times = [times[i] for i in idxs_sorted]
+            unit_addressees = [addressees[i] for i in idxs_sorted]
+            unit_scene_ids = [scene_ids[i] for i in idxs_sorted]
+            unit_relationship_stages = [relationship_stages[i] for i in idxs_sorted]
+            unit_scene_tones = [scene_tones[i] for i in idxs_sorted]
+            unit_context_notes = [context_notes[i] for i in idxs_sorted]
             units.append(
                 WorkUnit(
                     kind="dialog",
@@ -402,6 +456,11 @@ class BatchProcessor:
                     speakers=unit_speakers,
                     times=unit_times,
                     dialog_id=did,
+                    addressees=unit_addressees,
+                    scene_ids=unit_scene_ids,
+                    relationship_stages=unit_relationship_stages,
+                    scene_tones=unit_scene_tones,
+                    context_notes=unit_context_notes,
                 )
             )
 
@@ -409,7 +468,18 @@ class BatchProcessor:
         orphans.sort()
         for start in range(0, len(orphans), batch_size):
             chunk = orphans[start : start + batch_size]
-            units.append(WorkUnit(kind="single", indices=chunk))
+            units.append(
+                WorkUnit(
+                    kind="single",
+                    indices=chunk,
+                    speakers=[speakers[i] for i in chunk],
+                    addressees=[addressees[i] for i in chunk],
+                    scene_ids=[scene_ids[i] for i in chunk],
+                    relationship_stages=[relationship_stages[i] for i in chunk],
+                    scene_tones=[scene_tones[i] for i in chunk],
+                    context_notes=[context_notes[i] for i in chunk],
+                )
+            )
         return units
 
     # ---------- 单元执行 ----------
@@ -476,6 +546,11 @@ class BatchProcessor:
         speakers: list[str | None],
         times: list[float | None] | None,
         dialog_id: str | None,
+        addressees: list[str | None] | None = None,
+        scene_ids: list[str | None] | None = None,
+        relationship_stages: list[str | None] | None = None,
+        scene_tones: list[str | None] | None = None,
+        context_notes: list[str | None] | None = None,
         enable_rag: bool,
         rag_threshold: float | None,
         rag_top_k: int | None,
@@ -501,6 +576,16 @@ class BatchProcessor:
                         ct = c
                         break
         try:
+            context_kwargs = {}
+            for key, values in {
+                "addressees": addressees,
+                "scene_ids": scene_ids,
+                "relationship_stages": relationship_stages,
+                "scene_tones": scene_tones,
+                "context_notes": context_notes,
+            }.items():
+                if values and any(value is not None for value in values):
+                    context_kwargs[key] = values
             return await self.pipeline.translate_dialog(
                 sources,
                 speakers,
@@ -516,6 +601,7 @@ class BatchProcessor:
                 enable_vision=enable_vision,
                 project_id=project_id,
                 use_tm_exact_match=use_tm_exact_match,
+                **context_kwargs,
             )
         except Exception as exc:  # 兜底：理论上 translate_dialog 不抛
             logger.exception(
@@ -545,12 +631,43 @@ class BatchProcessor:
         enable_vision: bool = True,
         project_id: str | None = None,
         use_tm_exact_match: bool = False,
+        speakers: list[str | None] | None = None,
+        addressees: list[str | None] | None = None,
+        scene_ids: list[str | None] | None = None,
+        relationship_stages: list[str | None] | None = None,
+        scene_tones: list[str | None] | None = None,
+        context_notes: list[str | None] | None = None,
     ) -> list[TranslationResult]:
         from app.services.style_guide_service import ContentType
 
         results: list[TranslationResult] = []
         cts = content_types or [None] * len(sources)
-        for src, ct_hint in zip(sources, cts):
+        speaker_values = speakers or [None] * len(sources)
+        addressee_values = addressees or [None] * len(sources)
+        scene_id_values = scene_ids or [None] * len(sources)
+        relationship_stage_values = relationship_stages or [None] * len(sources)
+        scene_tone_values = scene_tones or [None] * len(sources)
+        context_note_values = context_notes or [None] * len(sources)
+        rows = zip(
+            sources,
+            cts,
+            speaker_values,
+            addressee_values,
+            scene_id_values,
+            relationship_stage_values,
+            scene_tone_values,
+            context_note_values,
+        )
+        for (
+            src,
+            ct_hint,
+            speaker,
+            addressee,
+            scene_id,
+            relationship_stage,
+            scene_tone,
+            context_note,
+        ) in rows:
             ct: ContentType | None = None
             if ct_hint:
                 for c in ContentType:
@@ -563,6 +680,18 @@ class BatchProcessor:
                             ct = c
                             break
             try:
+                context_kwargs = {
+                    key: value
+                    for key, value in {
+                        "speaker": speaker,
+                        "addressee": addressee,
+                        "scene_id": scene_id,
+                        "relationship_stage": relationship_stage,
+                        "scene_tone": scene_tone,
+                        "context_note": context_note,
+                    }.items()
+                    if value is not None
+                }
                 r = await self.pipeline.translate_single(
                     src,
                     enable_rag=enable_rag,
@@ -575,6 +704,7 @@ class BatchProcessor:
                     enable_vision=enable_vision,
                     project_id=project_id,
                     use_tm_exact_match=use_tm_exact_match,
+                    **context_kwargs,
                 )
             except Exception as exc:  # 兜底：理论上 translate_single 不抛
                 logger.exception("translate_single 兜底捕获: %s", exc)

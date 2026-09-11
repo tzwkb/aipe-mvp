@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 
 import pandas as pd
 import pytest
@@ -211,3 +212,134 @@ class TestParseDialogColumns:
                 "time": 2.5,
             },
         ]
+
+    def test_csv_preserves_expanded_dialog_context_columns(self):
+        df = pd.DataFrame(
+            {
+                "id": ["scene-1", "scene-1"],
+                "角色信息 无需本地化": ["奥黛丽", "阿尔杰"],
+                "受话人": ["阿尔杰", "奥黛丽"],
+                "场景ID": ["chapter34", "chapter34"],
+                "关系阶段": ["founding_period", "founding_period"],
+                "场景语气": ["guarded", "guarded"],
+                "参考信息": ["交易开始", "交付配方"],
+                "原文": ["我已经带来了。", "这是配方。"],
+            }
+        )
+        buf = io.StringIO()
+        df.to_csv(buf, index=False)
+
+        result = parse_text_bytes(buf.getvalue().encode("utf-8"), "dialog.csv")
+
+        assert result[0] == {
+            "source": "我已经带来了。",
+            "content_type": None,
+            "dialog_id": "scene-1",
+            "speaker": "奥黛丽",
+            "addressee": "阿尔杰",
+            "scene_id": "chapter34",
+            "relationship_stage": "founding_period",
+            "scene_tone": "guarded",
+            "context_note": "交易开始",
+        }
+
+    def test_json_addressee_list_is_normalized_for_entity_matching(self):
+        data = json.dumps(
+            [
+                {
+                    "source": "诸位，请听我说。",
+                    "id": "scene-1",
+                    "speaker": "克莱恩",
+                    "addressee_ids": ["奥黛丽", "阿尔杰"],
+                    "scene_id": "chapter34",
+                }
+            ],
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        result = parse_text_bytes(data, "dialog.json")
+
+        assert result[0]["addressee"] == "奥黛丽 | 阿尔杰"
+        assert result[0]["scene_id"] == "chapter34"
+
+
+def test_project_workbook_layout_selects_sheet_ranges_and_dialog_metadata():
+    cover = pd.DataFrame([["说明页"], ["不要作为待译文本"]])
+    trial = pd.DataFrame([[None] * 4 for _ in range(10)])
+    trial.iat[3, 0] = "灵界裂隙"
+    trial.iat[3, 2] = "玩法"
+    trial.iat[5, 0] = "奥黛丽"
+    trial.iat[5, 1] = "下午好，愚者先生。"
+    trial.iat[5, 2] = "塔罗会交易开始"
+    trial.iat[6, 0] = "阿尔杰"
+    trial.iat[6, 1] = "这是配方。"
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        cover.to_excel(writer, sheet_name="说明", header=False, index=False)
+        trial.to_excel(writer, sheet_name="试译", header=False, index=False)
+
+    content_scope = {
+        "workbook_layout": {
+            "sheet": "试译",
+            "sections": [
+                {
+                    "id": "functional",
+                    "row_start": 4,
+                    "row_end": 4,
+                    "source_column": "A",
+                    "content_type_column": "C",
+                    "context_note_column": "C",
+                },
+                {
+                    "id": "dialogue",
+                    "row_start": 6,
+                    "row_end": 7,
+                    "source_column": "B",
+                    "speaker_column": "A",
+                    "context_note_column": "C",
+                    "content_type": "剧情",
+                    "dialog_id": "scene.demo",
+                    "scene_id": "scene.demo",
+                    "relationship_stage": "early",
+                    "scene_tone": "guarded",
+                    "use_row_as_time": True,
+                },
+            ],
+        }
+    }
+
+    result = parse_text_bytes(
+        buf.getvalue(),
+        "trial.xlsx",
+        content_scope=content_scope,
+    )
+
+    assert result == [
+        {
+            "source": "灵界裂隙",
+            "content_type": "玩法",
+            "context_note": "玩法",
+        },
+        {
+            "source": "下午好，愚者先生。",
+            "content_type": "剧情",
+            "dialog_id": "scene.demo",
+            "speaker": "奥黛丽",
+            "scene_id": "scene.demo",
+            "relationship_stage": "early",
+            "scene_tone": "guarded",
+            "context_note": "塔罗会交易开始",
+            "time": 6.0,
+        },
+        {
+            "source": "这是配方。",
+            "content_type": "剧情",
+            "dialog_id": "scene.demo",
+            "speaker": "阿尔杰",
+            "scene_id": "scene.demo",
+            "relationship_stage": "early",
+            "scene_tone": "guarded",
+            "context_note": None,
+            "time": 7.0,
+        },
+    ]

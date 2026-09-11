@@ -45,6 +45,7 @@
 - **风格指南（Style Guide）**：约束译文的语言风格（武侠 / 江湖 / 古风调性）
 - **结构聚类（Cluster）**：将句式高度相似的句子合并为一次 LLM 调用，保证模板词一致性
 - **对话模式（Dialog Mode）**：按对话 ID 聚合，整段对话一次 LLM 调用，保持上下文连贯
+- **项目结构化上下文**：按 profile 中的人物别名、关系、场景和语境规则选择最小必要内容注入 Prompt
 
 ---
 
@@ -185,6 +186,15 @@ curl http://localhost:8000/api/v1/health
 | `rag_collection` | `string \| null` | 否 | `null` | 指定 Qdrant collection 名，`null` 使用配置默认值 |
 | `task_id` | `string \| null` | 否 | `null` | 自定义任务 ID，用于断点续传；不填则自动生成 16 位 hex |
 | `content_types` | `(string \| null)[] \| null` | 否 | `null` | 与 `texts` 一一对应的内容类型预标注；有值则跳过 LLM 自动分类 |
+| `dialog_mode` | `boolean` | 否 | `false` | 按 `dialog_ids` 聚合连续对话；提供非空 `dialog_ids` 时自动启用 |
+| `dialog_ids` | `(string \| null)[] \| null` | 否 | `null` | 每句对话 ID |
+| `speakers` | `(string \| null)[] \| null` | 否 | `null` | 每句实际说话人 |
+| `times` | `(float \| null)[] \| null` | 否 | `null` | 每句排序时刻；不会进入 Prompt |
+| `addressees` | `(string \| null)[] \| null` | 否 | `null` | 每句受话人 |
+| `scene_ids` | `(string \| null)[] \| null` | 否 | `null` | 每句显式场景 ID |
+| `relationship_stages` | `(string \| null)[] \| null` | 否 | `null` | 每句人物关系阶段 |
+| `scene_tones` | `(string \| null)[] \| null` | 否 | `null` | 每句场景语气 |
+| `context_notes` | `(string \| null)[] \| null` | 否 | `null` | 每句人工上下文备注 |
 
 **响应** `200 OK` → [BatchTranslateResponse](#batchtranslateresponse)
 
@@ -254,7 +264,8 @@ curl -X POST http://localhost:8000/api/v1/translate \
 | `rag_threshold` | `float` | 否 | `0.85` | RAG 相似度阈值，范围 `[0.0, 1.0]` |
 | `rag_top_k` | `integer` | 否 | `3` | RAG Top-K，范围 `[1, 10]` |
 | `enable_cluster` | `boolean` | 否 | `true` | 是否启用结构聚类（整组翻译路径）；关闭后全部走单句路径 |
-| `dialog_mode` | `boolean` | 否 | `false` | 对话模式：按 `id` 聚合，按 `time` 排序，整段一次 LLM 调用。需文件含 `id`/`说话人`/`time` 列 |
+| `dialog_mode` | `boolean` | 否 | `false` | 对话模式：按 `id` 聚合，按 `time` 排序，整段一次 LLM 调用；project workbook layout 声明固定对话段时自动启用 |
+| `project_id` | `string \| null` | 否 | `null` | 项目 profile ID；用于选择语言方向、style guide、RAG collection 和结构化上下文资产 |
 | `rag_collection` | `string \| null` | 否 | `null` | 指定 Qdrant collection 名 |
 | `task_id` | `string \| null` | 否 | `null` | 自定义任务 ID（断点续传） |
 
@@ -794,8 +805,16 @@ curl "http://localhost:8000/api/v1/style-guide?full=true"
 | 列 | 识别名 | 说明 |
 |----|--------|------|
 | 对话 ID | `id`、`dialog_id`、`对话id`、`对话编号`、`dialogue_id` | 相同 ID 的行聚合为同一段对话 |
-| 说话人 | `说话人`、`speaker`、`角色`、`name`、`character`、`actor` | 对话角色名 |
+| 说话人 | `说话人`、`speaker`、`speaker_id`、`角色`、`角色信息 无需本地化`、`name`、`character`、`actor` | 当前行实际说话人；只匹配该角色的 voice 规则 |
 | 时刻 | `time`、`时间`、`时刻`、`timestamp`、`t` | 数值型，用于对话内排序 |
+| 受话人 | `addressee`、`addressee_id(s)`、`受话人`、`对话对象` | 当前行对话对象；用于人物与关系命中 |
+| 场景 ID | `scene_id`、`Scene ID`、`场景ID`、`场景编号` | 优先精确匹配 profile 场景；缺失时再用原文 trigger 推断 |
+| 关系阶段 | `relationship_stage`、`Relationship Stage`、`关系阶段` | 选择阶段性人物关系和语境规则 |
+| 场景语气 | `scene_tone`、`Scene Tone`、`场景语气`、`情绪语气` | 选择语气规则 |
+| 上下文备注 | `context_note`、`Context Note`、`上下文备注`、`语境备注`、`参考信息` | 最小必要的人工场景说明 |
+
+所有对话上下文字段必须与原文逐行对齐；按 `time` 排序时会与对应原文一起移动。单行对话仍保留这些字段，再由 pipeline 委托给单句翻译。
+若所选 profile 声明 `content_scope.workbook_layout`，服务会按指定 sheet、行范围和列位读取非标准客户模板，不再假定首个 sheet 的首行为表头。
 
 ### 术语表文件（`/terminology/upload`）
 

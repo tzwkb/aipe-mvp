@@ -18,6 +18,11 @@ from fastapi.responses import StreamingResponse
 from app.dependencies import get_batch_processor
 from app.schemas.translate import BatchTranslateResponse, TranslateRequest
 from app.services.batch_processor import BatchProcessor
+from app.services.project_service import (
+    ProjectProfileError,
+    ProjectResourceManager,
+    get_project_resource_manager,
+)
 from app.utils.file_parser import parse_text_bytes
 
 logger = logging.getLogger(__name__)
@@ -75,6 +80,9 @@ async def translate(
         request.enable_vision,
         request.use_tm_exact_match,
     )
+    effective_dialog_mode = request.dialog_mode or bool(
+        request.dialog_ids and any(request.dialog_ids)
+    )
     return await processor.process(
         texts=request.texts,
         task_id=task_id,
@@ -85,6 +93,15 @@ async def translate(
         rag_collection=request.rag_collection,
         batch_size=request.batch_size,
         content_types=request.content_types,
+        dialog_ids=request.dialog_ids,
+        speakers=request.speakers,
+        times=request.times,
+        addressees=request.addressees,
+        scene_ids=request.scene_ids,
+        relationship_stages=request.relationship_stages,
+        scene_tones=request.scene_tones,
+        context_notes=request.context_notes,
+        dialog_mode=effective_dialog_mode,
         enable_web_search=request.enable_web_search,
         web_search_dense_threshold=request.web_search_dense_threshold,
         enable_vision=request.enable_vision,
@@ -109,7 +126,8 @@ async def translate_file(
         description=(
             "对话模式：按 id 聚合并按 time 排序，整段对话一次 LLM 调用。"
             "开启后跳过去重和结构聚类；无 id 的行退化为单句路径。"
-            "需要文件中包含 id / 说话人 / time 列。"
+            "需要文件中包含 id / 说话人 / time 列；project workbook layout 声明"
+            "固定 dialog_id 时会自动启用。"
         ),
     ),
     project_id: str | None = Form(None, description="项目档案 ID，如 wwm/zh-en；不填使用默认项目或旧全局状态"),
@@ -136,6 +154,7 @@ async def translate_file(
         description="是否直接采用 TM 精确源文匹配结果；命中则跳过 LLM 翻译，未命中照常翻译",
     ),
     task_id: str | None = Form(None),
+    project_resources: ProjectResourceManager = Depends(get_project_resource_manager),
     processor: BatchProcessor = Depends(get_batch_processor),
 ) -> BatchTranslateResponse:
     filename = file.filename or "uploaded.txt"
@@ -144,8 +163,16 @@ async def translate_file(
     finally:
         await file.close()
 
+    content_scope = None
+    effective_project_id = project_id or processor.settings.default_project
+    if effective_project_id:
+        try:
+            content_scope = project_resources.profile(effective_project_id).content_scope
+        except ProjectProfileError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
-        items = parse_text_bytes(raw, filename)
+        items = parse_text_bytes(raw, filename, content_scope=content_scope)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -155,11 +182,26 @@ async def translate_file(
     texts = [item["source"] for item in items]
     content_types = [item.get("content_type") for item in items]
 
+    profile_layout = (
+        content_scope.get("workbook_layout")
+        if isinstance(content_scope, dict)
+        else None
+    )
+    effective_dialog_mode = dialog_mode or (
+        isinstance(profile_layout, dict)
+        and any(item.get("dialog_id") for item in items)
+    )
     dialog_ids = speakers = times = None
-    if dialog_mode:
+    addressees = scene_ids = relationship_stages = scene_tones = context_notes = None
+    if effective_dialog_mode:
         dialog_ids = [item.get("dialog_id") for item in items]
         speakers = [item.get("speaker") for item in items]
         times = [item.get("time") for item in items]
+        addressees = [item.get("addressee") for item in items]
+        scene_ids = [item.get("scene_id") for item in items]
+        relationship_stages = [item.get("relationship_stage") for item in items]
+        scene_tones = [item.get("scene_tone") for item in items]
+        context_notes = [item.get("context_note") for item in items]
         if not any(dialog_ids):
             raise HTTPException(
                 status_code=400,
@@ -173,7 +215,7 @@ async def translate_file(
         filename,
         len(texts),
         enable_cluster,
-        dialog_mode,
+        effective_dialog_mode,
         enable_web_search,
         enable_vision,
         use_tm_exact_match,
@@ -192,7 +234,12 @@ async def translate_file(
         dialog_ids=dialog_ids,
         speakers=speakers,
         times=times,
-        dialog_mode=dialog_mode,
+        addressees=addressees,
+        scene_ids=scene_ids,
+        relationship_stages=relationship_stages,
+        scene_tones=scene_tones,
+        context_notes=context_notes,
+        dialog_mode=effective_dialog_mode,
         enable_web_search=enable_web_search,
         web_search_dense_threshold=web_search_dense_threshold,
         enable_vision=enable_vision,

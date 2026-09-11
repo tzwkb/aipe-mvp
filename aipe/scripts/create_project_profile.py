@@ -18,6 +18,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 
 def _safe_project_id(project_id: str) -> Path:
@@ -69,6 +70,18 @@ def create_project_profile(
     vision_system_prompt: str | None,
     allow_web_search: bool = True,
     force: bool = False,
+    profile_contract_version: int = 1,
+    profile_status: str = "active",
+    distribution: str = "internal_only",
+    authority_policy: list[str] | None = None,
+    terminology_status: dict[str, Any] | None = None,
+    assets: dict[str, Any] | None = None,
+    context_pipeline_mode: str = "off",
+    capabilities: dict[str, Any] | None = None,
+    module_context_views: dict[str, Any] | None = None,
+    content_scope: dict[str, Any] | None = None,
+    workflow: dict[str, Any] | None = None,
+    gaps: list[dict[str, Any]] | None = None,
 ) -> Path:
     project_dir = projects_dir / _safe_project_id(project_id)
     profile_path = project_dir / "profile.json"
@@ -82,7 +95,14 @@ def create_project_profile(
     if not resolved_source_lang or not resolved_target_lang:
         raise ValueError(f"无法从 language_pair/source_lang/target_lang 解析语言对: {language_pair!r}")
     _validate_language_pair_suffix(project_id, resolved_source_lang, resolved_target_lang)
-    payload: dict[str, str | bool] = {
+    if profile_contract_version not in {1, 2}:
+        raise ValueError("profile_contract_version 仅支持 1 或 2")
+    if context_pipeline_mode not in {"off", "shadow", "enforce"}:
+        raise ValueError("context_pipeline_mode 仅支持 off/shadow/enforce")
+    if not profile_status.strip() or not distribution.strip():
+        raise ValueError("profile_status / distribution 不能为空")
+
+    payload: dict[str, Any] = {
         "name": project_id,
         "language_pair": language_pair,
         "source_lang": resolved_source_lang,
@@ -91,6 +111,26 @@ def create_project_profile(
         "background": background,
         "allow_web_search": allow_web_search,
     }
+    if profile_contract_version >= 2:
+        payload = {
+            "profile_contract_version": profile_contract_version,
+            **payload,
+            "profile_status": profile_status.strip(),
+            "distribution": distribution.strip(),
+            "authority_policy": authority_policy or [],
+            "terminology_status": terminology_status or {},
+            "assets": assets or {},
+            "context_pipeline": {"mode": context_pipeline_mode},
+            "capabilities": capabilities or {},
+        }
+        if module_context_views:
+            payload["module_context_views"] = module_context_views
+    if content_scope:
+        payload["content_scope"] = content_scope
+    if workflow:
+        payload["workflow"] = workflow
+    if gaps:
+        payload["gaps"] = gaps
 
     style_rel = _asset_relative_to_profile(project_dir, style_guide)
     term_rel = _asset_relative_to_profile(project_dir, terminology)
@@ -130,6 +170,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--web-search-prefix", default=None)
     parser.add_argument("--prompt-notes", default=None)
     parser.add_argument("--vision-system-prompt", default=None)
+    parser.add_argument("--profile-contract-version", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--profile-status", default="active")
+    parser.add_argument("--distribution", default="internal_only")
+    parser.add_argument("--authority-policy-json", type=Path, default=None)
+    parser.add_argument("--terminology-status-json", type=Path, default=None)
+    parser.add_argument("--assets-json", type=Path, default=None)
+    parser.add_argument(
+        "--context-pipeline-mode",
+        choices=("off", "shadow", "enforce"),
+        default="off",
+    )
+    parser.add_argument("--capabilities-json", type=Path, default=None)
+    parser.add_argument("--module-context-views-json", type=Path, default=None)
+    parser.add_argument("--content-scope-json", type=Path, default=None)
+    parser.add_argument("--workflow-json", type=Path, default=None)
+    parser.add_argument("--gaps-json", type=Path, default=None)
     parser.add_argument(
         "--disable-web-search",
         action="store_true",
@@ -137,6 +193,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing profile.json")
     return parser.parse_args()
+
+
+def _read_json(path: Path | None, expected_type: type, label: str):
+    if path is None:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} 读取失败: {path}: {exc}") from exc
+    if not isinstance(value, expected_type):
+        raise ValueError(f"{label} 顶层类型必须是 {expected_type.__name__}: {path}")
+    return value
 
 
 def main() -> int:
@@ -157,6 +225,26 @@ def main() -> int:
         vision_system_prompt=args.vision_system_prompt,
         allow_web_search=not args.disable_web_search,
         force=args.force,
+        profile_contract_version=args.profile_contract_version,
+        profile_status=args.profile_status,
+        distribution=args.distribution,
+        authority_policy=_read_json(args.authority_policy_json, list, "authority policy JSON"),
+        terminology_status=_read_json(
+            args.terminology_status_json,
+            dict,
+            "terminology status JSON",
+        ),
+        assets=_read_json(args.assets_json, dict, "assets JSON"),
+        context_pipeline_mode=args.context_pipeline_mode,
+        capabilities=_read_json(args.capabilities_json, dict, "capabilities JSON"),
+        module_context_views=_read_json(
+            args.module_context_views_json,
+            dict,
+            "module context views JSON",
+        ),
+        content_scope=_read_json(args.content_scope_json, dict, "content scope JSON"),
+        workflow=_read_json(args.workflow_json, dict, "workflow JSON"),
+        gaps=_read_json(args.gaps_json, list, "gaps JSON"),
     )
     print(path)
     return 0

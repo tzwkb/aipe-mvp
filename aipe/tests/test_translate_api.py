@@ -5,6 +5,10 @@ LLM/RAG 通过依赖注入替换为 fake，不依赖外部服务。
 
 from __future__ import annotations
 
+import io
+from types import SimpleNamespace
+
+import pandas as pd
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -15,6 +19,7 @@ from app.dependencies import (
 from app.main import app
 from app.schemas.translate import TranslationResult
 from app.services.batch_processor import BatchProcessor
+from app.services.project_service import get_project_resource_manager
 
 
 class FakePipeline:
@@ -32,6 +37,7 @@ class FakePipeline:
         enable_vision=True,
         project_id=None,
         use_tm_exact_match=False,
+        **_context,
     ):
         if not text or not text.strip():
             return TranslationResult(source=text, translation="", status="error", error_msg="empty")
@@ -42,9 +48,11 @@ class FakePipeline:
         )
 
 
-def _override(processor: BatchProcessor):
+def _override(processor: BatchProcessor, project_resources=None):
     app.dependency_overrides[get_batch_processor] = lambda: processor
     app.dependency_overrides[get_translation_pipeline] = lambda: processor.pipeline
+    if project_resources is not None:
+        app.dependency_overrides[get_project_resource_manager] = lambda: project_resources
 
 
 def _clear_overrides():
@@ -132,5 +140,139 @@ def test_get_unknown_task_404(tmp_path):
         with TestClient(app) as client:
             assert client.get("/api/v1/translate/task/no_such").status_code == 404
             assert client.get("/api/v1/translate/task/no_such/csv").status_code == 404
+    finally:
+        _clear_overrides()
+
+
+def test_translate_json_forwards_parallel_dialog_context(tmp_path):
+    class FakeDialogPipeline(FakePipeline):
+        def __init__(self):
+            self.dialog_calls = []
+
+        async def translate_dialog(self, sources, speakers, **kwargs):
+            self.dialog_calls.append((list(sources), list(speakers), kwargs))
+            return [
+                TranslationResult(source=source, translation=source.upper(), status="success")
+                for source in sources
+            ]
+
+    pipeline = FakeDialogPipeline()
+    processor = BatchProcessor(
+        pipeline,  # type: ignore[arg-type]
+        Settings(progress_dir=str(tmp_path), batch_size=50),
+    )
+    _override(processor)
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/translate",
+                json={
+                    "project_id": None,
+                    "texts": ["第一句", "第二句"],
+                    "content_types": ["剧情", "剧情"],
+                    "dialog_ids": ["scene-1", "scene-1"],
+                    "speakers": ["甲", "乙"],
+                    "times": [2.0, 1.0],
+                    "addressees": ["乙", "甲"],
+                    "scene_ids": ["scene.demo", "scene.demo"],
+                    "relationship_stages": ["early", "early"],
+                    "scene_tones": ["guarded", "guarded"],
+                    "context_notes": ["later", "earlier"],
+                    "enable_rag": False,
+                    "task_id": "json_dialog_context",
+                },
+            )
+        assert response.status_code == 200, response.text
+        assert len(pipeline.dialog_calls) == 1
+        sources, speakers, kwargs = pipeline.dialog_calls[0]
+        assert sources == ["第二句", "第一句"]
+        assert speakers == ["乙", "甲"]
+        assert kwargs["addressees"] == ["甲", "乙"]
+        assert kwargs["scene_ids"] == ["scene.demo", "scene.demo"]
+        assert kwargs["context_notes"] == ["earlier", "later"]
+    finally:
+        _clear_overrides()
+
+
+def test_translate_file_uses_project_workbook_layout_and_auto_dialog_mode(tmp_path):
+    class FakeDialogPipeline(FakePipeline):
+        def __init__(self):
+            self.dialog_calls = []
+
+        async def translate_dialog(self, sources, speakers, **kwargs):
+            self.dialog_calls.append((list(sources), list(speakers), kwargs))
+            return [
+                TranslationResult(source=source, translation=source.upper(), status="success")
+                for source in sources
+            ]
+
+    content_scope = {
+        "workbook_layout": {
+            "sheet": "试译",
+            "sections": [
+                {
+                    "id": "dialogue",
+                    "row_start": 2,
+                    "row_end": 3,
+                    "source_column": "B",
+                    "speaker_column": "A",
+                    "content_type": "剧情",
+                    "dialog_id": "scene.demo",
+                    "scene_id": "scene.demo",
+                    "use_row_as_time": True,
+                }
+            ],
+        }
+    }
+
+    class FakeProjectResources:
+        def profile(self, project_id):
+            assert project_id == "demo/zh-en"
+            return SimpleNamespace(content_scope=content_scope)
+
+    cover = pd.DataFrame([["说明页"]])
+    trial = pd.DataFrame(
+        [
+            ["角色", "原文"],
+            ["奥黛丽", "下午好。"],
+            ["阿尔杰", "这是配方。"],
+        ]
+    )
+    workbook = io.BytesIO()
+    with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
+        cover.to_excel(writer, sheet_name="说明", header=False, index=False)
+        trial.to_excel(writer, sheet_name="试译", header=False, index=False)
+
+    pipeline = FakeDialogPipeline()
+    processor = BatchProcessor(
+        pipeline,  # type: ignore[arg-type]
+        Settings(progress_dir=str(tmp_path), batch_size=50),
+    )
+    _override(processor, FakeProjectResources())
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/translate/file",
+                files={
+                    "file": (
+                        "trial.xlsx",
+                        workbook.getvalue(),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                },
+                data={
+                    "project_id": "demo/zh-en",
+                    "enable_rag": "false",
+                    "task_id": "profile_layout_dialog",
+                },
+            )
+        assert response.status_code == 200, response.text
+        assert response.json()["completed"] == 2
+        assert len(pipeline.dialog_calls) == 1
+        sources, speakers, kwargs = pipeline.dialog_calls[0]
+        assert sources == ["下午好。", "这是配方。"]
+        assert speakers == ["奥黛丽", "阿尔杰"]
+        assert kwargs["dialog_id"] == "scene.demo"
+        assert kwargs["scene_ids"] == ["scene.demo", "scene.demo"]
     finally:
         _clear_overrides()

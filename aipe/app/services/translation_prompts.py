@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 
 from app.schemas.rag import RAGSearchResult
 from app.schemas.terminology import TermEntry
@@ -82,14 +83,16 @@ def build_single_messages(
     base_system: str,
     target_lang: str,
     web_refs: list[WebSearchResult] | None = None,
+    project_context: str = "",
 ) -> list[dict[str, str]]:
     system = style_guide_svc.build_system_prompt_for_type(base_system, content_type)
-    parts = _reference_sections(term_matches, references, web_refs)
+    parts = _reference_sections(term_matches, references, web_refs, project_context)
     parts.extend(
         [
             format_feedback_rules(content_type, target_lang),
             "## 待翻译文本",
             source,
+            _format_required_markers([source]),
             (
                 "\n请以 JSON 格式输出（仅输出 JSON，不含任何其他文字或 markdown）：\n"
                 '{"translation": "目标语译文", "reason": "用中文简述翻译理由，说明采用了哪些术语/RAG例句/网络资料，'
@@ -112,6 +115,7 @@ def build_group_messages(
     target_lang: str,
     web_refs: list[WebSearchResult] | None = None,
     locked_tm_results: list[TranslationResult | None] | None = None,
+    project_context: str = "",
 ) -> list[dict[str, str]]:
     system = style_guide_svc.build_system_prompt_for_type(base_system, content_type)
     intro_lines = [
@@ -123,7 +127,7 @@ def build_group_messages(
         intro_lines.append(f"识别出的共有结构提示：`{template_hint}`")
 
     parts = ["## 整组翻译任务", "\n".join(intro_lines)]
-    parts.extend(_reference_sections(term_matches, references, web_refs))
+    parts.extend(_reference_sections(term_matches, references, web_refs, project_context))
     locked_section = format_locked_tm_section(locked_tm_results or [])
     if locked_section:
         parts.append(locked_section)
@@ -132,6 +136,7 @@ def build_group_messages(
             format_feedback_rules(content_type, target_lang),
             "## 源文本",
             "\n".join(f"{index}. {source}" for index, source in enumerate(sources, 1)),
+            _format_required_markers(sources),
             (
                 "## 输出格式（严格遵守）\n"
                 '逐行输出，每行格式为 `序号. {"translation": "目标语译文", "reason": "简述理由（中文，1句话）"}`，'
@@ -156,6 +161,7 @@ def build_dialog_messages(
     target_lang: str,
     web_refs: list[WebSearchResult] | None = None,
     locked_tm_results: list[TranslationResult | None] | None = None,
+    project_context: str = "",
 ) -> list[dict[str, str]]:
     system = style_guide_svc.build_system_prompt_for_type(base_system, content_type)
     header = [f"以下是一段游戏内连续对话，共 {len(sources)} 句，按对话发生顺序列出。"]
@@ -171,7 +177,7 @@ def build_dialog_messages(
     )
 
     parts = ["## 对话翻译任务", "\n".join(header)]
-    parts.extend(_reference_sections(term_matches, references, web_refs))
+    parts.extend(_reference_sections(term_matches, references, web_refs, project_context))
     locked_section = format_locked_tm_section(locked_tm_results or [])
     if locked_section:
         parts.append(locked_section)
@@ -180,6 +186,7 @@ def build_dialog_messages(
             format_feedback_rules(content_type, target_lang),
             "## 对话内容",
             _format_dialog_lines(sources, speakers),
+            _format_required_markers(sources),
             (
                 "## 输出格式（严格遵守）\n"
                 '逐行输出，每行格式为 `序号. {"translation": "目标语译文", "reason": "简述理由（中文，1句话）"}`，'
@@ -271,14 +278,39 @@ def format_feedback_rules(content_type: ContentType, target_lang: str = "en") ->
     return "\n".join(lines)
 
 
+def _format_required_markers(sources: list[str]) -> str:
+    rows = []
+    for index, source in enumerate(sources, 1):
+        counts = Counter(re.findall(r'#[A-Z]|\{[^{}\n]*\}|</?[A-Za-z][^>\n]*>|%(?:\d+\$)?[sdif]', source))
+        if counts:
+            rows.append(f"{index}. " + ", ".join(f"{token} × {count}" for token, count in counts.items()))
+    if not rows:
+        return ""
+    return (
+        "## 输出前逐行检查\n"
+        "完整翻译所有段落，包括背景描述。下列标记必须逐字保留且每种标记的次数必须相同；"
+        "每对颜色标签包裹对应的译文，不得合并相邻标记、删掉重复标记或改成其他颜色。"
+        "数值改写为英文词也必须保留其标签；变量不得替换成推测的具体值。\n"
+        + "\n".join(rows)
+    )
+
+
 def _reference_sections(
     term_matches: list[TermEntry],
     references: list[RAGSearchResult],
     web_refs: list[WebSearchResult] | None,
+    project_context: str = "",
 ) -> list[str]:
     parts: list[str] = []
     if term_matches:
         parts.extend([_TERM_SECTION_TITLE, _format_term_section(term_matches)])
+    if project_context:
+        parts.extend(
+            [
+                "## 项目结构化上下文（人物、关系、场景与语境规则）",
+                project_context,
+            ]
+        )
     if references:
         parts.extend(
             [

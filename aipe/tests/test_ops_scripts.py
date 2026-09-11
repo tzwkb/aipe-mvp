@@ -95,6 +95,63 @@ def test_create_project_profile_requires_project_id_language_pair_suffix(tmp_pat
         raise AssertionError("expected ValueError")
 
 
+def test_create_project_profile_preserves_v2_context_contract(tmp_path):
+    from scripts.create_project_profile import create_project_profile
+
+    profile_path = create_project_profile(
+        projects_dir=tmp_path / "projects",
+        project_id="game/zh-en",
+        language_pair="ZH-EN",
+        game="Game",
+        background="",
+        style_guide=None,
+        terminology=None,
+        qdrant_collection=None,
+        web_search_prefix=None,
+        prompt_notes=None,
+        vision_system_prompt=None,
+        profile_contract_version=2,
+        profile_status="ready_with_gaps",
+        distribution="internal_only",
+        authority_policy=["client", "profile_maintainer"],
+        terminology_status={"state": "missing_client_asset"},
+        assets={
+            "entities": {
+                "kind": "entity_registry",
+                "path": "sources/entities.json",
+                "required": True,
+                "availability": "included",
+            }
+        },
+        context_pipeline_mode="enforce",
+        capabilities={
+            "assets.entity_registry@1": {"required": True, "asset": "entities"}
+        },
+        module_context_views={
+            "translation": {"capabilities": ["assets.entity_registry@1"]}
+        },
+        content_scope={"units": 47},
+        workflow={"review": "human"},
+        gaps=[{"id": "gap.terms", "status": "missing"}],
+    )
+
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert payload["profile_contract_version"] == 2
+    assert payload["profile_status"] == "ready_with_gaps"
+    assert payload["distribution"] == "internal_only"
+    assert payload["authority_policy"] == ["client", "profile_maintainer"]
+    assert payload["terminology_status"] == {"state": "missing_client_asset"}
+    assert payload["context_pipeline"] == {"mode": "enforce"}
+    assert payload["assets"]["entities"]["kind"] == "entity_registry"
+    assert payload["capabilities"]["assets.entity_registry@1"]["asset"] == "entities"
+    assert payload["module_context_views"]["translation"]["capabilities"] == [
+        "assets.entity_registry@1"
+    ]
+    assert payload["content_scope"] == {"units": 47}
+    assert payload["workflow"] == {"review": "human"}
+    assert payload["gaps"] == [{"id": "gap.terms", "status": "missing"}]
+
+
 def test_cleanup_commands_do_not_include_volumes_by_default():
     from scripts.cleanup_dev_stack import build_cleanup_commands
 

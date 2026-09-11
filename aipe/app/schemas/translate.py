@@ -15,6 +15,18 @@ class TranslateRequest(BaseModel):
     content_types: list[str | None] | None = Field(
         None, description="每句对应的文本类型（与 texts 一一对应），有则跳过 LLM 预分类"
     )
+    dialog_mode: bool = Field(
+        False,
+        description="按 dialog_ids 聚合连续对话；提供非空 dialog_ids 时自动启用",
+    )
+    dialog_ids: list[str | None] | None = Field(None, description="每句对应的对话 ID")
+    speakers: list[str | None] | None = Field(None, description="每句实际说话人")
+    times: list[float | None] | None = Field(None, description="每句排序时刻；不进入 Prompt")
+    addressees: list[str | None] | None = Field(None, description="每句受话人")
+    scene_ids: list[str | None] | None = Field(None, description="每句显式场景 ID")
+    relationship_stages: list[str | None] | None = Field(None, description="每句人物关系阶段")
+    scene_tones: list[str | None] | None = Field(None, description="每句场景语气")
+    context_notes: list[str | None] | None = Field(None, description="每句人工上下文备注")
     enable_web_search: bool = Field(
         False,
         description=(

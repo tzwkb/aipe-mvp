@@ -6,12 +6,18 @@ LLM / Embedding 全部用 fake 实现，不依赖任何外部服务。
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 from app.schemas.rag import RAGSearchResult
 from app.schemas.terminology import TermEntry
 from app.schemas.web_search import WebSearchResult
 from app.services.project_service import ProjectRegistry, ProjectResourceManager
 from app.services.rag_service import RAGDiagnostics
+from app.services.reference_corpus_service import (
+    ReferenceCorpusHit,
+    ReferenceCorpusService,
+)
 from app.services.style_guide_service import ContentType, StyleGuideService
 from app.services.terminology_service import TerminologyService
 from app.services.translation_pipeline import TranslationPipeline
@@ -19,15 +25,25 @@ from tests.pipeline_fakes import (
     FakeLLM,
     FakeRAG,
     FakeWebSearch,
+)
+from tests.pipeline_fakes import (
     make_pipeline as _make_pipeline,
+)
+from tests.pipeline_fakes import (
     write_min_project as _write_min_project,
+)
+from tests.pipeline_fakes import (
     write_project as _write_project,
 )
 
 
 def test_translate_single_happy_path():
     terms = [TermEntry(source="契丹", target="Khitan", category="势力")]
-    refs = [RAGSearchResult(source="契丹来犯", target="The Khitan are attacking", score=0.92)]
+    refs = [
+        RAGSearchResult(
+            source="契丹来犯", target="The Khitan are attacking", score=0.92
+        )
+    ]
 
     pipe, _, _, llm = _make_pipeline(
         terms=terms,
@@ -60,7 +76,9 @@ def test_translate_single_uses_project_resources_and_collection(tmp_path):
         style="WWM style",
         collection="wwm_corpus",
     )
-    project_resources = ProjectResourceManager(ProjectRegistry(projects_dir=projects, default_project="wwm/zh-en"))
+    project_resources = ProjectResourceManager(
+        ProjectRegistry(projects_dir=projects, default_project="wwm/zh-en")
+    )
     rag = FakeRAG()
     llm = FakeLLM(response_fn=lambda msgs: "From Where Winds Meet.")
     pipe = TranslationPipeline(
@@ -80,6 +98,79 @@ def test_translate_single_uses_project_resources_and_collection(tmp_path):
     assert "WWM style" in system_msg
 
 
+def test_translate_single_uses_separate_local_reference_collection(tmp_path):
+    projects = tmp_path / "projects"
+    _write_project(
+        projects,
+        "lom/zh-en",
+        term_source="克莱恩",
+        term_target="Klein",
+        style="LOM style",
+        collection="lom_zh_en_corpus",
+    )
+    profile_path = projects / "lom/zh-en/profile.json"
+    raw_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw_profile["reference_qdrant_collection"] = "lom_reference_en_sparse_v1"
+    raw_profile["reference_context"] = {"scene_chapter_map": {"scene.chapter34": [34]}}
+    profile_path.write_text(
+        json.dumps(raw_profile, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    project_resources = ProjectResourceManager(
+        ProjectRegistry(projects_dir=projects, default_project="lom/zh-en")
+    )
+
+    class FakeReferenceCorpus:
+        def __init__(self):
+            self.calls = []
+
+        async def search(self, query, **kwargs):
+            self.calls.append((query, kwargs))
+            return [
+                ReferenceCorpusHit(
+                    score=4.2,
+                    chunk_id="lom.chapter.0001.chunk.002",
+                    chapter_number=1,
+                    chapter_title="Crimson",
+                    line_start=100,
+                    line_end=155,
+                    text="Klein Moretti looked into the mirror.",
+                    source_aliases=("克莱恩",),
+                    client_terms=(),
+                )
+            ]
+
+        render = staticmethod(ReferenceCorpusService.render)
+
+    reference = FakeReferenceCorpus()
+    rag = FakeRAG()
+    llm = FakeLLM(response_fn=lambda msgs: "Klein returned.")
+    pipe = TranslationPipeline(
+        TerminologyService(),
+        rag,
+        StyleGuideService(),
+        llm,
+        project_resources=project_resources,
+        reference_corpus_svc=reference,
+    )
+
+    result = asyncio.run(
+        pipe.translate_single(
+            "克莱恩回来了。",
+            project_id="lom/zh-en",
+            scene_id="scene.chapter34",
+        )
+    )
+
+    assert result.status == "success"
+    assert reference.calls[0][1]["collection"] == "lom_reference_en_sparse_v1"
+    assert reference.calls[0][1]["required_source_aliases"] == ["克莱恩"]
+    assert reference.calls[0][1]["chapter_numbers"] == {34}
+    user_msg = llm.calls[0][1]["content"]
+    assert "Lord.txt L100-L155" in user_msg
+    assert "Klein Moretti looked into the mirror" in user_msg
+
+
 def test_translate_single_project_language_pair_overrides_hardcoded_english(tmp_path):
     projects = tmp_path / "projects"
     _write_min_project(
@@ -90,7 +181,9 @@ def test_translate_single_project_language_pair_overrides_hardcoded_english(tmp_
         target_lang="de",
         collection="isekai_de_corpus",
     )
-    project_resources = ProjectResourceManager(ProjectRegistry(projects_dir=projects, default_project="isekai/en-de"))
+    project_resources = ProjectResourceManager(
+        ProjectRegistry(projects_dir=projects, default_project="isekai/en-de")
+    )
     rag = FakeRAG()
     llm = FakeLLM(response_fn=lambda msgs: "Deutsche Übersetzung.")
     pipe = TranslationPipeline(
@@ -101,7 +194,9 @@ def test_translate_single_project_language_pair_overrides_hardcoded_english(tmp_
         project_resources=project_resources,
     )
 
-    result = asyncio.run(pipe.translate_single("Village Elder", project_id="isekai/en-de"))
+    result = asyncio.run(
+        pipe.translate_single("Village Elder", project_id="isekai/en-de")
+    )
 
     assert result.status == "success"
     system_msg = llm.calls[0][0]["content"]
@@ -214,7 +309,9 @@ def test_translate_single_no_term_match_skips_term_section():
 
 def test_translate_single_speech_prompt_softens_terms_and_self_reference():
     terms = [TermEntry(source="燕叽", target="Windtail")]
-    pipe, _, _, llm = _make_pipeline(terms=terms, llm_response_fn=lambda msgs: "I got it.")
+    pipe, _, _, llm = _make_pipeline(
+        terms=terms, llm_response_fn=lambda msgs: "I got it."
+    )
 
     asyncio.run(
         pipe.translate_single(
@@ -232,7 +329,9 @@ def test_translate_single_speech_prompt_softens_terms_and_self_reference():
 
 def test_translate_single_functional_prompt_keeps_terms_strict_and_concise():
     terms = [TermEntry(source="燕云", target="Where Winds Meet")]
-    pipe, _, _, llm = _make_pipeline(terms=terms, llm_response_fn=lambda msgs: "Task text.")
+    pipe, _, _, llm = _make_pipeline(
+        terms=terms, llm_response_fn=lambda msgs: "Task text."
+    )
 
     asyncio.run(
         pipe.translate_single(
@@ -248,7 +347,9 @@ def test_translate_single_functional_prompt_keeps_terms_strict_and_concise():
 
 
 def test_translate_single_quest_description_uses_contextual_prompt_rules():
-    pipe, _, _, llm = _make_pipeline(llm_response_fn=lambda msgs: "Narrative quest text.")
+    pipe, _, _, llm = _make_pipeline(
+        llm_response_fn=lambda msgs: "Narrative quest text."
+    )
 
     asyncio.run(
         pipe.translate_single(
@@ -265,7 +366,9 @@ def test_translate_single_quest_description_uses_contextual_prompt_rules():
 def test_translate_single_prompt_includes_wwm_feedback_hard_style_rules():
     pipe, _, _, llm = _make_pipeline(llm_response_fn=lambda msgs: "ok")
 
-    asyncio.run(pipe.translate_single("这……这可怎么好……", content_type=ContentType.STORY))
+    asyncio.run(
+        pipe.translate_single("这……这可怎么好……", content_type=ContentType.STORY)
+    )
 
     user_msg = llm.calls[0][1]["content"]
     assert "不要使用 em dash" in user_msg
@@ -276,7 +379,9 @@ def test_translate_single_prompt_includes_wwm_feedback_hard_style_rules():
 def test_translate_single_does_not_mutate_source_for_llm():
     """确认改造后不再做占位符替换：LLM 拿到的是原文。"""
     terms = [TermEntry(source="燕云", target="Yanyun")]
-    pipe, _, _, llm = _make_pipeline(terms=terms, llm_response_fn=lambda msgs: "From Yanyun.")
+    pipe, _, _, llm = _make_pipeline(
+        terms=terms, llm_response_fn=lambda msgs: "From Yanyun."
+    )
     asyncio.run(pipe.translate_single("我从燕云来"))
     user_msg = llm.calls[0][1]["content"]
     assert "我从燕云来" in user_msg
@@ -374,12 +479,16 @@ def test_translate_single_tm_exact_match_can_skip_ai_translation():
 
 
 def test_translate_single_tm_exact_match_default_keeps_ai_flow():
-    exact = RAGSearchResult(source="契丹来犯", target="The Khitan are attacking", score=1.0)
+    exact = RAGSearchResult(
+        source="契丹来犯", target="The Khitan are attacking", score=1.0
+    )
     rag = FakeRAG(exact_results_by_query={"契丹来犯": [exact]})
     llm = FakeLLM(response_fn=lambda m: "AI translation")
     pipe = TranslationPipeline(TerminologyService(), rag, StyleGuideService(), llm)
 
-    result = asyncio.run(pipe.translate_single("契丹来犯", content_type=ContentType.QUEST_DESCRIPTION))
+    result = asyncio.run(
+        pipe.translate_single("契丹来犯", content_type=ContentType.QUEST_DESCRIPTION)
+    )
 
     assert result.translation == "AI translation"
     assert result.tm_exact_match_used is False
@@ -388,8 +497,11 @@ def test_translate_single_tm_exact_match_default_keeps_ai_flow():
 
 
 def test_translate_group_partial_tm_match_preserves_full_context():
-    exact = RAGSearchResult(source="源1", target="TM target 1", score=1.0, status="Done")
+    exact = RAGSearchResult(
+        source="源1", target="TM target 1", score=1.0, status="Done"
+    )
     rag = FakeRAG(exact_results_by_query={"源1": [exact]})
+
     def respond(messages):
         user_msg = messages[-1]["content"]
         if "整组翻译任务" in user_msg:
@@ -424,8 +536,16 @@ def test_translate_group_partial_tm_match_preserves_full_context():
 
 def test_translate_dialog_partial_tm_match_preserves_full_context():
     exact_by_query = {
-        "前文": [RAGSearchResult(source="前文", target="TM previous", score=1.0, status="Done")],
-        "后文": [RAGSearchResult(source="后文", target="TM following", score=1.0, status="Done")],
+        "前文": [
+            RAGSearchResult(
+                source="前文", target="TM previous", score=1.0, status="Done"
+            )
+        ],
+        "后文": [
+            RAGSearchResult(
+                source="后文", target="TM following", score=1.0, status="Done"
+            )
+        ],
     }
     rag = FakeRAG(exact_results_by_query=exact_by_query)
 
@@ -525,11 +645,17 @@ def test_translate_group_includes_merged_rag_refs():
     """整组路径应对每句独立 RAG 检索后合并去重。"""
     refs_by_q = {
         "活动【柿】获取": [
-            RAGSearchResult(source="活动【A】获取", target="Obtain from Event: A", score=0.9),
+            RAGSearchResult(
+                source="活动【A】获取", target="Obtain from Event: A", score=0.9
+            ),
         ],
         "活动【燕】获取": [
-            RAGSearchResult(source="活动【B】获取", target="Obtain from Event: B", score=0.85),
-            RAGSearchResult(source="活动【A】获取", target="Obtain from Event: A", score=0.7),
+            RAGSearchResult(
+                source="活动【B】获取", target="Obtain from Event: B", score=0.85
+            ),
+            RAGSearchResult(
+                source="活动【A】获取", target="Obtain from Event: A", score=0.7
+            ),
         ],
     }
     rag = FakeRAG(results_by_query=refs_by_q, top_k=3)
@@ -597,7 +723,9 @@ def test_translate_group_llm_error_falls_back_to_singles():
     results = asyncio.run(pipe.translate_group(["a", "b"]))
 
     assert len(results) == 2
-    assert all(r.translation == "fallback ok" and r.status == "success" for r in results)
+    assert all(
+        r.translation == "fallback ok" and r.status == "success" for r in results
+    )
 
 
 def test_translate_group_empty_source_falls_back():
@@ -680,13 +808,92 @@ def test_translate_dialog_happy_path_includes_speakers_in_prompt():
     assert "t=" not in user_msg
 
 
+def test_translate_dialog_forwards_expanded_metadata_and_injects_selected_context():
+    class SpyContext:
+        def __init__(self):
+            self.calls = []
+
+        def render(self, sources, **kwargs):
+            self.calls.append((list(sources), kwargs))
+            return "Alice --trading_partner_of--> Bob\nvoice=bright and polite"
+
+    class FakeProjectResources:
+        def __init__(self):
+            self.context = SpyContext()
+            self.term_svc = TerminologyService()
+            self.style_svc = StyleGuideService()
+            self.profile_value = SimpleNamespace(
+                game="Demo",
+                language_pair="ZH-EN",
+                source_lang="zh",
+                target_lang="en",
+                background="Demo background",
+                qdrant_collection="demo_corpus",
+                web_search_prefix=None,
+                allow_web_search=False,
+                vision_system_prompt=None,
+            )
+
+        def profile(self, _project_id):
+            return self.profile_value
+
+        def prompt_notes(self, _project_id):
+            return ""
+
+        def terminology(self, _project_id):
+            return self.term_svc
+
+        def style_guide(self, _project_id):
+            return self.style_svc
+
+        def project_context(self, _project_id):
+            return self.context
+
+    resources = FakeProjectResources()
+    llm = FakeLLM(response_fn=lambda _messages: "1. Done.\n2. Understood.")
+    pipe = TranslationPipeline(
+        TerminologyService(),
+        FakeRAG(),
+        StyleGuideService(),
+        llm,
+        project_resources=resources,  # type: ignore[arg-type]
+    )
+
+    asyncio.run(
+        pipe.translate_dialog(
+            ["我已经带来了。", "那就成交。"],
+            ["奥黛丽", "奥黛丽"],
+            addressees=["阿尔杰", "阿尔杰"],
+            dialog_id="chapter34",
+            scene_ids=["scene.chapter34", "scene.chapter34"],
+            relationship_stages=["founding_period", "founding_period"],
+            scene_tones=["guarded", "guarded"],
+            context_notes=["交易开始", "交易完成"],
+            project_id="demo/zh-en",
+            content_type=ContentType.SPEECH,
+            enable_rag=False,
+        )
+    )
+
+    sources, kwargs = resources.context.calls[0]
+    assert sources == ["我已经带来了。", "那就成交。"]
+    assert kwargs["speakers"] == ["奥黛丽", "奥黛丽"]
+    assert kwargs["addressees"] == ["阿尔杰", "阿尔杰"]
+    assert kwargs["dialog_id"] == "chapter34"
+    assert kwargs["scene_ids"] == ["scene.chapter34", "scene.chapter34"]
+    assert kwargs["relationship_stages"] == ["founding_period", "founding_period"]
+    assert kwargs["scene_tones"] == ["guarded", "guarded"]
+    assert kwargs["context_notes"] == ["交易开始", "交易完成"]
+    user_msg = llm.calls[0][1]["content"]
+    assert "项目结构化上下文" in user_msg
+    assert "Alice --trading_partner_of--> Bob" in user_msg
+
+
 def test_translate_dialog_parse_failure_marks_entire_segment_error():
     """LLM 输出无法对齐 → 整段标 error，不回退单句。"""
     pipe, _, _, llm = _make_pipeline(llm_response_fn=lambda m: "胡乱输出 没有编号")
 
-    results = asyncio.run(
-        pipe.translate_dialog(["s1", "s2", "s3"], ["A", "B", "A"])
-    )
+    results = asyncio.run(pipe.translate_dialog(["s1", "s2", "s3"], ["A", "B", "A"]))
 
     assert len(results) == 3
     assert all(r.status == "error" for r in results)
@@ -749,7 +956,10 @@ def test_translate_dialog_accepts_non_1n_numbering():
 
     results = asyncio.run(
         pipe.translate_dialog(
-            sources, speakers, dialog_id="13001585", times=[11000.0, 11001.0, 11002.0, 11004.0, 11005.0]
+            sources,
+            speakers,
+            dialog_id="13001585",
+            times=[11000.0, 11001.0, 11002.0, 11004.0, 11005.0],
         )
     )
 
@@ -766,13 +976,9 @@ def test_translate_dialog_accepts_non_1n_numbering():
 
 def test_translate_dialog_prompt_does_not_include_time():
     """time 仅用于排序，不应注入 prompt，避免 LLM 当行号。"""
-    pipe, _, _, llm = _make_pipeline(
-        llm_response_fn=lambda m: "1. A\n2. B"
-    )
+    pipe, _, _, llm = _make_pipeline(llm_response_fn=lambda m: "1. A\n2. B")
     asyncio.run(
-        pipe.translate_dialog(
-            ["源1", "源2"], ["甲", "乙"], times=[11000.0, 11001.0]
-        )
+        pipe.translate_dialog(["源1", "源2"], ["甲", "乙"], times=[11000.0, 11001.0])
     )
     user_msg = llm.calls[0][1]["content"]
     assert "11000" not in user_msg
@@ -825,7 +1031,10 @@ def test_web_search_triggers_when_all_conditions_met():
     assert "凌霄破" in user_msg
     assert "example.com/img.png" in user_msg  # 图片 URL 也注入
     assert result.web_search_triggered is True
-    assert result.web_references and result.web_references[0]["title"] == "新外观「凌霄破」"
+    assert (
+        result.web_references
+        and result.web_references[0]["title"] == "新外观「凌霄破」"
+    )
 
 
 def test_web_search_skipped_when_term_matched():
@@ -916,8 +1125,8 @@ def test_web_search_failure_silently_degrades():
     )
     result = asyncio.run(pipe.translate_single("某条新词", enable_web_search=True))
     assert result.status == "success"
-    assert result.web_search_triggered is True   # 试图触发了
-    assert result.web_references is None          # 但没有结果（异常）
+    assert result.web_search_triggered is True  # 试图触发了
+    assert result.web_references is None  # 但没有结果（异常）
     user_msg = llm.calls[0][1]["content"]
     assert "外部网络参考" not in user_msg
 
@@ -926,13 +1135,15 @@ def test_web_search_uses_search_with_diagnostics_path():
     """启用 web search 时 RAG 必须走 search_with_diagnostics 而不是普通 search。"""
     web = FakeWebSearch(results=_web_results())
     pipe, _, rag, _ = _make_pipeline(
-        diagnostics=RAGDiagnostics(dense_top1=0.9, sparse_hits=2),  # 不触发但走 diagnostics
+        diagnostics=RAGDiagnostics(
+            dense_top1=0.9, sparse_hits=2
+        ),  # 不触发但走 diagnostics
         web_search=web,
         llm_response_fn=lambda m: "ok",
     )
     asyncio.run(pipe.translate_single("某条新词", enable_web_search=True))
     assert len(rag.diag_calls) == 1
-    assert web.calls == []   # 条件不满足，没触发
+    assert web.calls == []  # 条件不满足，没触发
 
 
 def test_web_search_group_path_uses_single_representative_query():
@@ -965,7 +1176,9 @@ def test_web_search_dialog_path_uses_single_representative_query():
         llm_response_fn=lambda m: "1. A\n2. B\n3. C",
     )
     results = asyncio.run(
-        pipe.translate_dialog(["新词1", "新词2", "新词3"], ["甲", "乙", "甲"], enable_web_search=True)
+        pipe.translate_dialog(
+            ["新词1", "新词2", "新词3"], ["甲", "乙", "甲"], enable_web_search=True
+        )
     )
     assert len(results) == 3
     assert len(web.calls) == 1
@@ -1004,6 +1217,8 @@ def test_web_search_custom_threshold_overrides_default():
         llm_response_fn=lambda m: "ok",
     )
     asyncio.run(
-        pipe.translate_single("某条新词", enable_web_search=True, web_search_dense_threshold=0.4)
+        pipe.translate_single(
+            "某条新词", enable_web_search=True, web_search_dense_threshold=0.4
+        )
     )
-    assert web.calls == []   # 阈值放宽到 0.4，0.5 ≥ 0.4 → 不触发
+    assert web.calls == []  # 阈值放宽到 0.4，0.5 ≥ 0.4 → 不触发

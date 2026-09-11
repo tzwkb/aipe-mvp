@@ -91,13 +91,36 @@ def _parse_line_text(text: str) -> tuple[str, str | None]:
 
 
 def _extract_translation_reason(text: str) -> tuple[str, str | None] | None:
-    """Extract malformed JSON fields containing unescaped quotes as a fallback."""
-    translation_match = re.search(r'"translation"\s*:\s*"([^"]*)"', text)
-    if not translation_match:
-        return None
-    reason_match = re.search(r'"reason"\s*:\s*"(.*)"[\s\n]*\}', text, re.DOTALL)
-    reason = reason_match.group(1).strip() if reason_match else None
-    return translation_match.group(1).strip(), reason or None
+    """Recover wrapped JSON and malformed strings without truncating quoted text."""
+    start = text.find("{")
+    if start >= 0:
+        try:
+            data, _ = json.JSONDecoder(strict=False).raw_decode(text, start)
+            if isinstance(data, dict) and "translation" in data:
+                return str(data["translation"]).strip(), str(data.get("reason") or "").strip() or None
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    fields = re.search(
+        r'"translation"\s*:\s*"(.*)"\s*,\s*"reason"\s*:\s*"(.*)"\s*\}',
+        text,
+        re.DOTALL,
+    )
+    if fields:
+        return _decode_field(fields.group(1)), _decode_field(fields.group(2)) or None
+    translation = re.search(r'"translation"\s*:\s*"(.*)"\s*\}', text, re.DOTALL)
+    return (_decode_field(translation.group(1)), None) if translation else None
+
+
+def _decode_field(value: str) -> str:
+    try:
+        return json.loads('"' + value + '"', strict=False).strip()
+    except (json.JSONDecodeError, ValueError):
+        return re.sub(
+            r'\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})',
+            lambda match: json.loads('"' + match.group(0) + '"'),
+            value,
+        ).strip()
 
 
 __all__ = [

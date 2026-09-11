@@ -12,6 +12,7 @@ from app.services.project_service import (
     get_project_resource_manager,
 )
 from app.services.rag_service import RAGService, get_rag_service
+from app.services.reference_corpus_service import ReferenceCorpusService
 from app.services.style_guide_service import (
     StyleGuideService,
     get_style_guide_service,
@@ -23,7 +24,6 @@ from app.services.terminology_service import (
 from app.services.translation_pipeline import TranslationPipeline
 from app.services.vision_service import VisionService
 from app.services.web_search_service import WebSearchService
-
 
 SettingsDep = Depends(get_settings)
 
@@ -59,6 +59,15 @@ def get_vision_service() -> VisionService:
 
 
 @lru_cache
+def _build_reference_corpus_service() -> ReferenceCorpusService:
+    return ReferenceCorpusService(get_settings())
+
+
+def get_reference_corpus_service() -> ReferenceCorpusService:
+    return _build_reference_corpus_service()
+
+
+@lru_cache
 def _build_pipeline() -> TranslationPipeline:
     settings = get_settings()
     return TranslationPipeline(
@@ -70,6 +79,7 @@ def _build_pipeline() -> TranslationPipeline:
         web_search_dense_threshold=settings.web_search_dense_threshold,
         vision_svc=get_vision_service(),
         project_resources=get_project_resource_manager(),
+        reference_corpus_svc=get_reference_corpus_service(),
     )
 
 
@@ -89,25 +99,27 @@ def get_batch_processor() -> BatchProcessor:
 
 
 __all__ = [
-    "Settings",
-    "get_settings",
-    "SettingsDep",
-    "get_llm_service",
-    "get_terminology_service",
-    "get_style_guide_service",
-    "get_rag_service",
-    "get_web_search_service",
-    "get_vision_service",
-    "get_project_resource_manager",
-    "get_translation_pipeline",
-    "get_batch_processor",
-    "LLMService",
-    "TerminologyService",
-    "StyleGuideService",
-    "RAGService",
-    "WebSearchService",
-    "VisionService",
-    "ProjectResourceManager",
-    "TranslationPipeline",
     "BatchProcessor",
+    "LLMService",
+    "ProjectResourceManager",
+    "RAGService",
+    "ReferenceCorpusService",
+    "Settings",
+    "SettingsDep",
+    "StyleGuideService",
+    "TerminologyService",
+    "TranslationPipeline",
+    "VisionService",
+    "WebSearchService",
+    "get_batch_processor",
+    "get_llm_service",
+    "get_project_resource_manager",
+    "get_rag_service",
+    "get_reference_corpus_service",
+    "get_settings",
+    "get_style_guide_service",
+    "get_terminology_service",
+    "get_translation_pipeline",
+    "get_vision_service",
+    "get_web_search_service",
 ]

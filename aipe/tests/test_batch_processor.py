@@ -39,6 +39,13 @@ class FakePipeline:
         enable_vision=True,
         project_id=None,
         use_tm_exact_match=False,
+        speaker=None,
+        addressee=None,
+        dialog_id=None,
+        scene_id=None,
+        relationship_stage=None,
+        scene_tone=None,
+        context_note=None,
     ):
         self.calls.append(text)
         self.project_ids.append(project_id)
@@ -457,6 +464,11 @@ class FakePipelineWithDialog(FakePipeline):
         enable_vision=True,
         project_id=None,
         use_tm_exact_match=False,
+        addressees=None,
+        scene_ids=None,
+        relationship_stages=None,
+        scene_tones=None,
+        context_notes=None,
     ):
         self.dialog_calls.append(
             {
@@ -464,8 +476,29 @@ class FakePipelineWithDialog(FakePipeline):
                 "speakers": list(speakers),
                 "dialog_id": dialog_id,
                 "times": list(times) if times else None,
+                "addressees": list(addressees) if addressees else None,
+                "scene_ids": list(scene_ids) if scene_ids else None,
+                "relationship_stages": (
+                    list(relationship_stages) if relationship_stages else None
+                ),
+                "scene_tones": list(scene_tones) if scene_tones else None,
+                "context_notes": list(context_notes) if context_notes else None,
             }
         )
+        if len(sources) == 1:
+            return [
+                await self.translate_single(
+                    sources[0],
+                    project_id=project_id,
+                    speaker=speakers[0],
+                    addressee=addressees[0] if addressees else None,
+                    dialog_id=dialog_id,
+                    scene_id=scene_ids[0] if scene_ids else None,
+                    relationship_stage=relationship_stages[0] if relationship_stages else None,
+                    scene_tone=scene_tones[0] if scene_tones else None,
+                    context_note=context_notes[0] if context_notes else None,
+                )
+            ]
         return [
             TranslationResult(source=s, translation=f"[D:{dialog_id}]{s.upper()}", status="success")
             for s in sources
@@ -514,8 +547,8 @@ def test_dialog_mode_groups_by_id_and_sorts_by_time(tmp_path):
     assert resp.results[2].translation == "[D:b]B1"
 
 
-def test_dialog_mode_single_id_falls_back_to_single_unit(tmp_path):
-    """只有一行的 dialog_id 不值得开 dialog prompt，退化为 single 路径。"""
+def test_dialog_mode_single_id_preserves_metadata_and_delegates_to_single(tmp_path):
+    """单行 dialog 仍经 dialog 入口保留元数据，再由 pipeline 委托给单句路径。"""
     pipe = FakePipelineWithDialog()
     proc = BatchProcessor(pipe, _settings(tmp_path, batch_size=50))  # type: ignore[arg-type]
     texts = ["solo"]
@@ -534,10 +567,40 @@ def test_dialog_mode_single_id_falls_back_to_single_unit(tmp_path):
         )
     )
 
-    # 没走 dialog 路径，走 single
-    assert pipe.dialog_calls == []
+    assert len(pipe.dialog_calls) == 1
+    assert pipe.dialog_calls[0]["dialog_id"] == "only_one"
     assert pipe.calls == ["solo"]
     assert resp.results[0].translation == "SOLO"
+
+
+def test_dialog_mode_sorts_expanded_context_fields_with_each_line(tmp_path):
+    pipe = FakePipelineWithDialog()
+    proc = BatchProcessor(pipe, _settings(tmp_path, batch_size=50))  # type: ignore[arg-type]
+
+    asyncio.run(
+        proc.process(
+            ["later", "earlier"],
+            task_id="t_dlg_context_sort",
+            dialog_ids=["scene-1", "scene-1"],
+            speakers=["乙", "甲"],
+            times=[2.0, 1.0],
+            addressees=["甲", "乙"],
+            scene_ids=["scene.late", "scene.early"],
+            relationship_stages=["late", "early"],
+            scene_tones=["warm", "guarded"],
+            context_notes=["later note", "earlier note"],
+            dialog_mode=True,
+        )
+    )
+
+    call = pipe.dialog_calls[0]
+    assert call["sources"] == ["earlier", "later"]
+    assert call["speakers"] == ["甲", "乙"]
+    assert call["addressees"] == ["乙", "甲"]
+    assert call["scene_ids"] == ["scene.early", "scene.late"]
+    assert call["relationship_stages"] == ["early", "late"]
+    assert call["scene_tones"] == ["guarded", "warm"]
+    assert call["context_notes"] == ["earlier note", "later note"]
 
 
 def test_dialog_mode_orphans_without_id_go_to_single(tmp_path):

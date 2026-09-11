@@ -20,8 +20,28 @@ _CATEGORY_ALIASES = {"category", "类型", "分类"}
 _NOTES_ALIASES = {"notes", "note", "备注", "说明"}
 _CONTENT_TYPE_ALIASES = {"content_type", "文本类型", "类型", "type", "category", "分类"}
 _DIALOG_ID_ALIASES = {"id", "dialog_id", "对话id", "对话编号", "dialogue_id"}
-_SPEAKER_ALIASES = {"说话人", "speaker", "角色", "name", "character", "actor"}
+_SPEAKER_ALIASES = {
+    "说话人",
+    "speaker",
+    "speaker_id",
+    "角色",
+    "角色信息 无需本地化",
+    "name",
+    "character",
+    "actor",
+}
 _TIME_ALIASES = {"time", "时间", "时刻", "timestamp", "t"}
+_ADDRESSEE_ALIASES = {"addressee", "addressee_id", "addressee_ids", "受话人", "对话对象"}
+_SCENE_ID_ALIASES = {"scene_id", "scene id", "场景id", "场景编号"}
+_RELATIONSHIP_STAGE_ALIASES = {"relationship_stage", "relationship stage", "关系阶段"}
+_SCENE_TONE_ALIASES = {"scene_tone", "scene tone", "场景语气", "情绪语气"}
+_CONTEXT_NOTE_ALIASES = {
+    "context_note",
+    "context note",
+    "上下文备注",
+    "语境备注",
+    "参考信息",
+}
 
 
 def parse_terminology_file(path: str | Path) -> list[dict]:
@@ -38,7 +58,8 @@ def parse_terminology_file(path: str | Path) -> list[dict]:
     suffix = p.suffix.lower()
     try:
         if suffix in {".xlsx", ".xls"}:
-            df = pd.read_excel(p, dtype=str)
+            sheets = pd.read_excel(p, dtype=str, sheet_name=None)
+            return _normalize_terminology_sheets(sheets)
         elif suffix == ".csv":
             df = pd.read_csv(p, dtype=str)
         else:
@@ -58,7 +79,8 @@ def parse_terminology_bytes(data: bytes, filename: str) -> list[dict]:
 
     try:
         if suffix in {".xlsx", ".xls"}:
-            df = pd.read_excel(io.BytesIO(data), dtype=str)
+            sheets = pd.read_excel(io.BytesIO(data), dtype=str, sheet_name=None)
+            return _normalize_terminology_sheets(sheets)
         elif suffix == ".csv":
             df = pd.read_csv(io.BytesIO(data), dtype=str)
         else:
@@ -69,6 +91,32 @@ def parse_terminology_bytes(data: bytes, filename: str) -> list[dict]:
         raise TerminologyError(f"术语表解析失败: {exc}") from exc
 
     return _normalize_terminology_df(df)
+
+
+def _normalize_terminology_sheets(sheets: dict[str, pd.DataFrame]) -> list[dict]:
+    entries: list[dict] = []
+    seen_sources: set[str] = set()
+    multi_sheet = len(sheets) > 1
+
+    for sheet_name, df in sheets.items():
+        if df.empty:
+            continue
+        if multi_sheet and not _has_named_term_columns(df.columns):
+            continue
+        for entry in _normalize_terminology_df(df):
+            source = entry["source"]
+            if source in seen_sources:
+                continue
+            seen_sources.add(source)
+            if multi_sheet and not entry.get("category"):
+                entry["category"] = str(sheet_name).strip()
+            entries.append(entry)
+    return entries
+
+
+def _has_named_term_columns(columns: Iterable) -> bool:
+    normalized = {str(column).strip().lower() for column in columns}
+    return bool(normalized & _SOURCE_ALIASES) and bool(normalized & _TARGET_ALIASES)
 
 
 def _normalize_terminology_df(df: pd.DataFrame) -> list[dict]:
@@ -329,15 +377,24 @@ def _resolve_corpus_columns(columns: Iterable) -> dict[str, str]:
     return out
 
 
-def parse_text_file(path: str | Path) -> list[dict]:
+def parse_text_file(
+    path: str | Path,
+    *,
+    content_scope: dict | None = None,
+) -> list[dict]:
     """从磁盘读取待翻译文本，返回 ``[{source, content_type}, ...]``。"""
     p = Path(path)
     if not p.exists():
         raise ValueError(f"文件不存在: {p}")
-    return parse_text_bytes(p.read_bytes(), p.name)
+    return parse_text_bytes(p.read_bytes(), p.name, content_scope=content_scope)
 
 
-def parse_text_bytes(data: bytes, filename: str) -> list[dict]:
+def parse_text_bytes(
+    data: bytes,
+    filename: str,
+    *,
+    content_scope: dict | None = None,
+) -> list[dict]:
     """从内存字节解析待翻译文本（上传接口用）。
 
     支持：
@@ -369,6 +426,13 @@ def parse_text_bytes(data: bytes, filename: str) -> list[dict]:
     if suffix in {".xlsx", ".xls"}:
         import io
 
+        workbook_layout = (
+            content_scope.get("workbook_layout")
+            if isinstance(content_scope, dict)
+            else None
+        )
+        if isinstance(workbook_layout, dict):
+            return _extract_profile_workbook(data, workbook_layout)
         try:
             df = pd.read_excel(io.BytesIO(data), dtype=str)
         except Exception as exc:
@@ -389,12 +453,122 @@ def parse_text_bytes(data: bytes, filename: str) -> list[dict]:
     )
 
 
+def _extract_profile_workbook(data: bytes, layout: dict) -> list[dict]:
+    import io
+
+    sheet = str(layout.get("sheet") or "").strip()
+    sections = layout.get("sections")
+    if not sheet or not isinstance(sections, list) or not sections:
+        raise ValueError("project workbook_layout 必须声明 sheet 和非空 sections")
+    try:
+        df = pd.read_excel(
+            io.BytesIO(data),
+            sheet_name=sheet,
+            header=None,
+            dtype=object,
+        )
+    except Exception as exc:
+        raise ValueError(f"Excel project layout 解析失败: {exc}") from exc
+
+    out: list[dict] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            raise ValueError("project workbook_layout.sections 必须是对象数组")
+        section_id = str(section.get("id") or "unnamed")
+        try:
+            row_start = int(section["row_start"])
+            row_end = int(section.get("row_end", row_start))
+            source_index = _excel_column_index(section["source_column"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"project workbook section 非法: {section_id}: {exc}") from exc
+        if row_start < 1 or row_end < row_start:
+            raise ValueError(f"project workbook section 行范围非法: {section_id}")
+
+        for row_number in range(row_start, row_end + 1):
+            source = _clean(_workbook_cell(df, row_number, source_index))
+            if not source:
+                continue
+            entry: dict = {"source": source, "content_type": None}
+            content_type = _section_context_value(
+                df,
+                row_number,
+                section,
+                "content_type",
+            )
+            entry["content_type"] = _clean(content_type) or None
+
+            for field_name in (
+                "dialog_id",
+                "speaker",
+                "addressee",
+                "scene_id",
+                "relationship_stage",
+                "scene_tone",
+                "context_note",
+            ):
+                if field_name not in section and f"{field_name}_column" not in section:
+                    continue
+                value = _section_context_value(
+                    df,
+                    row_number,
+                    section,
+                    field_name,
+                )
+                cleaner = _clean_context_value if field_name == "addressee" else _clean
+                entry[field_name] = cleaner(value) or None
+
+            if section.get("use_row_as_time") is True:
+                entry["time"] = float(row_number)
+            elif "time" in section or "time_column" in section:
+                entry["time"] = _parse_time(
+                    _section_context_value(df, row_number, section, "time")
+                )
+            out.append(entry)
+    return out
+
+
+def _section_context_value(
+    df: pd.DataFrame,
+    row_number: int,
+    section: dict,
+    field_name: str,
+):
+    column_key = f"{field_name}_column"
+    if column_key in section:
+        column_index = _excel_column_index(section[column_key])
+        value = _workbook_cell(df, row_number, column_index)
+        if _clean(value):
+            return value
+    return section.get(field_name)
+
+
+def _workbook_cell(df: pd.DataFrame, row_number: int, column_index: int):
+    row_index = row_number - 1
+    if row_index < 0 or row_index >= len(df.index) or column_index >= len(df.columns):
+        return None
+    return df.iat[row_index, column_index]
+
+
+def _excel_column_index(value) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < 1:
+            raise ValueError(f"Excel 列序号必须 >= 1: {value}")
+        return value - 1
+    label = str(value or "").strip().upper()
+    if not label or any(character < "A" or character > "Z" for character in label):
+        raise ValueError(f"Excel 列名非法: {value!r}")
+    index = 0
+    for character in label:
+        index = index * 26 + ord(character) - ord("A") + 1
+    return index - 1
+
+
 def _extract_source_with_type(df: pd.DataFrame) -> list[dict]:
     """从 DataFrame 提取 source 列和可选的 content_type / 对话相关列。
 
-    当文件中出现 ``id`` / ``说话人`` / ``time`` 中的任意列时，会把它们附加到每个 item
-    上（键名固定为 ``dialog_id`` / ``speaker`` / ``time``）。仅在该列存在时附加，避免
-    污染普通文本翻译路径的返回结构。
+    对话字段采用固定键名透传：``dialog_id`` / ``speaker`` / ``time`` / ``addressee`` /
+    ``scene_id`` / ``relationship_stage`` / ``scene_tone`` / ``context_note``。仅在源文件存在
+    对应列时附加，避免污染普通文本翻译路径的返回结构。
     """
     if df.empty:
         return []
@@ -416,11 +590,25 @@ def _extract_source_with_type(df: pd.DataFrame) -> list[dict]:
     id_col = _find(_DIALOG_ID_ALIASES)
     speaker_col = _find(_SPEAKER_ALIASES)
     time_col = _find(_TIME_ALIASES)
+    addressee_col = _find(_ADDRESSEE_ALIASES)
+    scene_id_col = _find(_SCENE_ID_ALIASES)
+    relationship_stage_col = _find(_RELATIONSHIP_STAGE_ALIASES)
+    scene_tone_col = _find(_SCENE_TONE_ALIASES)
+    context_note_col = _find(_CONTEXT_NOTE_ALIASES)
 
     # content_type 别名与 dialog_id/speaker/time 在 type/category/name 上可能冲突；
     # 若 type_col 与对话列指向同一物理列，content_type 让位，避免把"说话人"误读成
     # 文本类型。
-    if type_col is not None and type_col in {id_col, speaker_col, time_col}:
+    if type_col is not None and type_col in {
+        id_col,
+        speaker_col,
+        time_col,
+        addressee_col,
+        scene_id_col,
+        relationship_stage_col,
+        scene_tone_col,
+        context_note_col,
+    }:
         type_col = None
 
     out: list[dict] = []
@@ -438,6 +626,16 @@ def _extract_source_with_type(df: pd.DataFrame) -> list[dict]:
             entry["speaker"] = _clean(row.get(speaker_col)) or None
         if time_col:
             entry["time"] = _parse_time(row.get(time_col))
+        if addressee_col:
+            entry["addressee"] = _clean_context_value(row.get(addressee_col)) or None
+        if scene_id_col:
+            entry["scene_id"] = _clean(row.get(scene_id_col)) or None
+        if relationship_stage_col:
+            entry["relationship_stage"] = _clean(row.get(relationship_stage_col)) or None
+        if scene_tone_col:
+            entry["scene_tone"] = _clean(row.get(scene_tone_col)) or None
+        if context_note_col:
+            entry["context_note"] = _clean(row.get(context_note_col)) or None
         out.append(entry)
     return out
 
@@ -453,6 +651,12 @@ def _parse_time(value) -> float | None:
         return None
 
 
+def _clean_context_value(value) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return " | ".join(part for item in value if (part := _clean(item)))
+    return _clean(value)
+
+
 def _extract_source_from_json(obj) -> list[dict]:
     if not isinstance(obj, list):
         raise ValueError("JSON 输入必须是数组：[\"...\"] 或 [{\"source\": \"...\"}, ...]")
@@ -462,6 +666,21 @@ def _extract_source_from_json(obj) -> list[dict]:
     id_lc = {a.lower() for a in _DIALOG_ID_ALIASES}
     speaker_lc = {a.lower() for a in _SPEAKER_ALIASES}
     time_lc = {a.lower() for a in _TIME_ALIASES}
+    addressee_lc = {a.lower() for a in _ADDRESSEE_ALIASES}
+    scene_id_lc = {a.lower() for a in _SCENE_ID_ALIASES}
+    relationship_stage_lc = {a.lower() for a in _RELATIONSHIP_STAGE_ALIASES}
+    scene_tone_lc = {a.lower() for a in _SCENE_TONE_ALIASES}
+    context_note_lc = {a.lower() for a in _CONTEXT_NOTE_ALIASES}
+    reserved_context_lc = (
+        id_lc
+        | speaker_lc
+        | time_lc
+        | addressee_lc
+        | scene_id_lc
+        | relationship_stage_lc
+        | scene_tone_lc
+        | context_note_lc
+    )
 
     out: list[dict] = []
     for item in obj:
@@ -477,12 +696,19 @@ def _extract_source_from_json(obj) -> list[dict]:
         did: str | None = None
         speaker: str | None = None
         ts: float | None = None
+        addressee: str | None = None
+        scene_id: str | None = None
+        relationship_stage: str | None = None
+        scene_tone: str | None = None
+        context_note: str | None = None
         has_id = has_speaker = has_time = False
+        has_addressee = has_scene_id = has_relationship_stage = False
+        has_scene_tone = has_context_note = False
         for key, value in item.items():
             kl = str(key).strip().lower()
             if src is None and kl in src_lc:
                 src = _clean(value)
-            elif ct is None and kl in ct_lc and kl not in id_lc | speaker_lc | time_lc:
+            elif ct is None and kl in ct_lc and kl not in reserved_context_lc:
                 ct = _clean(value)
             elif kl in id_lc:
                 has_id = True
@@ -493,6 +719,21 @@ def _extract_source_from_json(obj) -> list[dict]:
             elif kl in time_lc:
                 has_time = True
                 ts = _parse_time(value)
+            elif kl in addressee_lc:
+                has_addressee = True
+                addressee = _clean_context_value(value) or None
+            elif kl in scene_id_lc:
+                has_scene_id = True
+                scene_id = _clean(value) or None
+            elif kl in relationship_stage_lc:
+                has_relationship_stage = True
+                relationship_stage = _clean(value) or None
+            elif kl in scene_tone_lc:
+                has_scene_tone = True
+                scene_tone = _clean(value) or None
+            elif kl in context_note_lc:
+                has_context_note = True
+                context_note = _clean(value) or None
         if not src:
             continue
         entry: dict = {"source": src, "content_type": ct or None}
@@ -502,6 +743,16 @@ def _extract_source_from_json(obj) -> list[dict]:
             entry["speaker"] = speaker
         if has_time:
             entry["time"] = ts
+        if has_addressee:
+            entry["addressee"] = addressee
+        if has_scene_id:
+            entry["scene_id"] = scene_id
+        if has_relationship_stage:
+            entry["relationship_stage"] = relationship_stage
+        if has_scene_tone:
+            entry["scene_tone"] = scene_tone
+        if has_context_note:
+            entry["context_note"] = context_note
         out.append(entry)
     return out
 

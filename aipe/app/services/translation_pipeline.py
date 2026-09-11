@@ -20,8 +20,10 @@ from app.schemas.terminology import TermEntry
 from app.schemas.translate import TranslationResult
 from app.schemas.web_search import WebSearchResult
 from app.services.llm_service import LLMService
+from app.services.project_context_service import ProjectContextService
 from app.services.project_service import ProjectResourceManager
 from app.services.rag_service import RAGDiagnostics, RAGService
+from app.services.reference_corpus_service import ReferenceCorpusService
 from app.services.style_guide_service import ContentType, StyleGuideService
 from app.services.terminology_service import TerminologyService
 from app.services.translation_memory import TMExactMatchResolver, merge_exact_results
@@ -55,6 +57,9 @@ class _ProjectContext:
     web_search_prefix: str | None
     allow_web_search: bool
     vision_system_prompt: str | None
+    context_svc: ProjectContextService | None
+    reference_collection: str | None
+    reference_config: dict
 
 
 class TranslationPipeline:
@@ -70,6 +75,7 @@ class TranslationPipeline:
         web_search_dense_threshold: float = 0.6,
         vision_svc: VisionService | None = None,
         project_resources: ProjectResourceManager | None = None,
+        reference_corpus_svc: ReferenceCorpusService | None = None,
     ):
         self.terminology_svc = terminology_svc
         self.rag_svc = rag_svc
@@ -81,6 +87,7 @@ class TranslationPipeline:
         self.default_web_search_dense_threshold = web_search_dense_threshold
         self.vision_svc = vision_svc
         self.project_resources = project_resources
+        self.reference_corpus_svc = reference_corpus_svc
 
     # ---------- 单句路径 ----------
 
@@ -98,6 +105,13 @@ class TranslationPipeline:
         enable_vision: bool = True,
         project_id: str | None = None,
         use_tm_exact_match: bool = False,
+        speaker: str | None = None,
+        addressee: str | None = None,
+        dialog_id: str | None = None,
+        scene_id: str | None = None,
+        relationship_stage: str | None = None,
+        scene_tone: str | None = None,
+        context_note: str | None = None,
     ) -> TranslationResult:
         """端到端翻译一句。失败时返回 status=error，不抛异常（保证批量不被单句拖垮）。
 
@@ -131,10 +145,14 @@ class TranslationPipeline:
 
         # Step 0: 文本类型分类（传入时跳过，否则 LLM 预分类）
         if content_type is None:
-            content_type = await self._classify_text(source, style_guide_svc=project_ctx.style_guide_svc)
+            content_type = await self._classify_text(
+                source, style_guide_svc=project_ctx.style_guide_svc
+            )
             logger.debug("文本分类: %r… → %s", source[:30], content_type.value)
         else:
-            logger.debug("文本分类(复用传入): %r… → %s", source[:30], content_type.value)
+            logger.debug(
+                "文本分类(复用传入): %r… → %s", source[:30], content_type.value
+            )
 
         # Step 1: 术语命中匹配（仅作为 Prompt 参考段，不修改原文）
         term_matches = project_ctx.terminology_svc.find_matches(source)
@@ -176,6 +194,29 @@ class TranslationPipeline:
         )
 
         # Step 3: Prompt 组装
+        profile_context = (
+            project_ctx.context_svc.render(
+                [source],
+                content_type=content_type.value,
+                speakers=[speaker],
+                addressees=[addressee],
+                dialog_id=dialog_id,
+                scene_ids=[scene_id],
+                relationship_stages=[relationship_stage],
+                scene_tones=[scene_tone],
+                context_notes=[context_note],
+            )
+            if project_ctx.context_svc is not None
+            else ""
+        )
+        reference_context = await self._reference_context(
+            project_ctx,
+            [source],
+            term_matches,
+            identity_values=[speaker, addressee],
+            scene_keys=[dialog_id, scene_id],
+        )
+        project_context = self._join_context(profile_context, reference_context)
         messages = build_single_messages(
             source,
             term_matches,
@@ -185,6 +226,7 @@ class TranslationPipeline:
             style_guide_svc=project_ctx.style_guide_svc,
             base_system=project_ctx.base_system,
             target_lang=project_ctx.target_lang,
+            project_context=project_context,
         )
 
         image_analysis = extract_image_analysis(web_refs)
@@ -299,7 +341,9 @@ class TranslationPipeline:
 
         # Step 0: 分类（传入时跳过，否则对代表句预分类）
         if content_type is None:
-            content_type = await self._classify_text(cleaned[0], style_guide_svc=project_ctx.style_guide_svc)
+            content_type = await self._classify_text(
+                cleaned[0], style_guide_svc=project_ctx.style_guide_svc
+            )
             logger.debug(
                 "整组分类: size=%d 代表句=%r → %s",
                 len(cleaned),
@@ -318,13 +362,18 @@ class TranslationPipeline:
                 direct.content_type = content_type.value
 
         # Step 1: 术语命中（对每句独立扫描后并集去重，保持出现顺序）
-        term_matches = self._collect_terms(cleaned, terminology_svc=project_ctx.terminology_svc)
+        term_matches = self._collect_terms(
+            cleaned, terminology_svc=project_ctx.terminology_svc
+        )
 
         # Step 2: RAG（每句并行检索，按 score 合并去重）
         references: list[RAGSearchResult] = []
         if enable_rag:
             references = await self._collect_references(
-                cleaned, threshold=rag_threshold, top_k=rag_top_k, collection=effective_collection
+                cleaned,
+                threshold=rag_threshold,
+                top_k=rag_top_k,
+                collection=effective_collection,
             )
 
         # Step 2.5: 整组 Web 搜索兜底（只用代表句触发，整组共享一次结果）
@@ -344,6 +393,17 @@ class TranslationPipeline:
         )
 
         # Step 3: 构建整组 prompt
+        profile_context = (
+            project_ctx.context_svc.render(cleaned, content_type=content_type.value)
+            if project_ctx.context_svc is not None
+            else ""
+        )
+        reference_context = await self._reference_context(
+            project_ctx,
+            cleaned,
+            term_matches,
+        )
+        project_context = self._join_context(profile_context, reference_context)
         messages = build_group_messages(
             cleaned,
             term_matches,
@@ -355,6 +415,7 @@ class TranslationPipeline:
             base_system=project_ctx.base_system,
             target_lang=project_ctx.target_lang,
             locked_tm_results=direct_results,
+            project_context=project_context,
         )
 
         # Step 4: LLM 调用
@@ -439,6 +500,11 @@ class TranslationPipeline:
         enable_vision: bool = True,
         project_id: str | None = None,
         use_tm_exact_match: bool = False,
+        addressees: list[str | None] | None = None,
+        scene_ids: list[str | None] | None = None,
+        relationship_stages: list[str | None] | None = None,
+        scene_tones: list[str | None] | None = None,
+        context_notes: list[str | None] | None = None,
     ) -> list[TranslationResult]:
         """整段对话翻译。``sources`` 已按对话发生顺序排列，``speakers`` 与之等长。
 
@@ -458,6 +524,18 @@ class TranslationPipeline:
             raise ValueError(
                 f"times 长度({len(times)}) 与 sources 长度({len(sources)}) 不一致"
             )
+        optional_context = {
+            "addressees": addressees,
+            "scene_ids": scene_ids,
+            "relationship_stages": relationship_stages,
+            "scene_tones": scene_tones,
+            "context_notes": context_notes,
+        }
+        for field_name, values in optional_context.items():
+            if values is not None and len(values) != len(sources):
+                raise ValueError(
+                    f"{field_name} 长度({len(values)}) 与 sources 长度({len(sources)}) 不一致"
+                )
 
         if len(sources) == 1:
             return [
@@ -473,6 +551,15 @@ class TranslationPipeline:
                     enable_vision=enable_vision,
                     project_id=project_id,
                     use_tm_exact_match=use_tm_exact_match,
+                    speaker=speakers[0],
+                    addressee=addressees[0] if addressees else None,
+                    dialog_id=dialog_id,
+                    scene_id=scene_ids[0] if scene_ids else None,
+                    relationship_stage=(
+                        relationship_stages[0] if relationship_stages else None
+                    ),
+                    scene_tone=scene_tones[0] if scene_tones else None,
+                    context_note=context_notes[0] if context_notes else None,
                 )
             ]
 
@@ -494,6 +581,13 @@ class TranslationPipeline:
                 enable_vision=enable_vision,
                 project_id=project_id,
                 use_tm_exact_match=use_tm_exact_match,
+                speakers=speakers,
+                addressees=addressees,
+                dialog_id=dialog_id,
+                scene_ids=scene_ids,
+                relationship_stages=relationship_stages,
+                scene_tones=scene_tones,
+                context_notes=context_notes,
             )
 
         direct_results: list[TranslationResult | None] = [None] * len(cleaned)
@@ -508,19 +602,26 @@ class TranslationPipeline:
 
         # Step 0: 分类（传入时跳过；否则对代表句预分类）
         if content_type is None:
-            content_type = await self._classify_text(cleaned[0], style_guide_svc=project_ctx.style_guide_svc)
+            content_type = await self._classify_text(
+                cleaned[0], style_guide_svc=project_ctx.style_guide_svc
+            )
         for direct in direct_results:
             if direct is not None and direct.content_type is None:
                 direct.content_type = content_type.value
 
         # Step 1: 术语命中并集
-        term_matches = self._collect_terms(cleaned, terminology_svc=project_ctx.terminology_svc)
+        term_matches = self._collect_terms(
+            cleaned, terminology_svc=project_ctx.terminology_svc
+        )
 
         # Step 2: RAG
         references: list[RAGSearchResult] = []
         if enable_rag:
             references = await self._collect_references(
-                cleaned, threshold=rag_threshold, top_k=rag_top_k, collection=effective_collection
+                cleaned,
+                threshold=rag_threshold,
+                top_k=rag_top_k,
+                collection=effective_collection,
             )
 
         # Step 2.5: 对话 Web 搜索兜底（用首句作代表句，整段共享）
@@ -539,13 +640,42 @@ class TranslationPipeline:
         )
 
         # Step 3: 对话 prompt（times 仅用于排序，不进 prompt）
+        profile_context = (
+            project_ctx.context_svc.render(
+                cleaned,
+                content_type=content_type.value,
+                speakers=speakers,
+                addressees=addressees,
+                dialog_id=dialog_id,
+                scene_ids=scene_ids,
+                relationship_stages=relationship_stages,
+                scene_tones=scene_tones,
+                context_notes=context_notes,
+            )
+            if project_ctx.context_svc is not None
+            else ""
+        )
+        reference_context = await self._reference_context(
+            project_ctx,
+            cleaned,
+            term_matches,
+            identity_values=[*(speakers or []), *(addressees or [])],
+            scene_keys=[dialog_id, *(scene_ids or [])],
+        )
+        project_context = self._join_context(profile_context, reference_context)
         messages = build_dialog_messages(
-            cleaned, speakers, term_matches, references, content_type, dialog_id,
+            cleaned,
+            speakers,
+            term_matches,
+            references,
+            content_type,
+            dialog_id,
             web_refs=web_refs,
             style_guide_svc=project_ctx.style_guide_svc,
             base_system=project_ctx.base_system,
             target_lang=project_ctx.target_lang,
             locked_tm_results=direct_results,
+            project_context=project_context,
         )
 
         term_view = self._term_used_view(term_matches)
@@ -646,7 +776,9 @@ class TranslationPipeline:
 
     # ---------- helpers ----------
 
-    def _resolve_project(self, project_id: str | None, rag_collection: str | None) -> _ProjectContext:
+    def _resolve_project(
+        self, project_id: str | None, rag_collection: str | None
+    ) -> _ProjectContext:
         if project_id and self.project_resources is not None:
             profile = self.project_resources.profile(project_id)
             prompt_notes = self.project_resources.prompt_notes(project_id)
@@ -659,9 +791,17 @@ class TranslationPipeline:
                 web_search_prefix=profile.web_search_prefix,
                 allow_web_search=profile.allow_web_search,
                 vision_system_prompt=profile.vision_system_prompt,
+                context_svc=self.project_resources.project_context(project_id),
+                reference_collection=getattr(
+                    profile, "reference_qdrant_collection", None
+                ),
+                reference_config=getattr(profile, "reference_context", {}) or {},
             )
         if project_id and self.project_resources is None:
-            logger.warning("收到 project_id=%s，但未配置 ProjectResourceManager，使用旧全局状态", project_id)
+            logger.warning(
+                "收到 project_id=%s，但未配置 ProjectResourceManager，使用旧全局状态",
+                project_id,
+            )
         return _ProjectContext(
             terminology_svc=self.terminology_svc,
             style_guide_svc=self.style_guide_svc,
@@ -671,7 +811,89 @@ class TranslationPipeline:
             web_search_prefix=None,
             allow_web_search=True,
             vision_system_prompt=None,
+            context_svc=None,
+            reference_collection=None,
+            reference_config={},
         )
+
+    async def _reference_context(
+        self,
+        project_ctx: _ProjectContext,
+        sources: list[str],
+        term_matches: list[TermEntry],
+        *,
+        identity_values: list[str | None] | None = None,
+        scene_keys: list[str | None] | None = None,
+    ) -> str:
+        if self.reference_corpus_svc is None or not project_ctx.reference_collection:
+            return ""
+        contextual_terms = list(term_matches)
+        for value in identity_values or []:
+            if str(value or "").strip():
+                contextual_terms.extend(
+                    project_ctx.terminology_svc.find_matches(str(value))
+                )
+        deduped: list[TermEntry] = []
+        seen: set[tuple[str, str]] = set()
+        for term in contextual_terms:
+            key = (term.source.strip(), term.target.strip())
+            if not all(key) or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(term)
+        if not deduped:
+            return ""
+
+        query_parts = [
+            *[str(source or "").strip() for source in sources],
+            *[str(value or "").strip() for value in identity_values or []],
+            *[term.source for term in deduped],
+            *[term.target for term in deduped],
+        ]
+        query = "\n".join(part for part in query_parts if part)
+        scene_chapter_map = project_ctx.reference_config.get("scene_chapter_map")
+        chapter_numbers: set[int] = set()
+        if isinstance(scene_chapter_map, dict):
+            for scene_key in scene_keys or []:
+                mapped = scene_chapter_map.get(str(scene_key or "").strip())
+                if isinstance(mapped, list):
+                    chapter_numbers.update(
+                        number
+                        for number in mapped
+                        if isinstance(number, int) and number > 0
+                    )
+        top_k = _bounded_positive_int(
+            project_ctx.reference_config.get("top_k"), default=3, maximum=6
+        )
+        try:
+            hits = await self.reference_corpus_svc.search(
+                query,
+                collection=project_ctx.reference_collection,
+                required_source_aliases=[term.source for term in deduped],
+                chapter_numbers=chapter_numbers,
+                top_k=top_k,
+            )
+        except Exception as exc:
+            logger.warning("项目英文参考语料检索失败，跳过: %s", exc)
+            return ""
+        return self.reference_corpus_svc.render(
+            hits,
+            target_anchors=[term.target for term in deduped],
+            max_chars=_bounded_positive_int(
+                project_ctx.reference_config.get("max_chars"),
+                default=3600,
+                maximum=6000,
+            ),
+            excerpt_chars=_bounded_positive_int(
+                project_ctx.reference_config.get("excerpt_chars"),
+                default=900,
+                maximum=1400,
+            ),
+        )
+
+    @staticmethod
+    def _join_context(*parts: str) -> str:
+        return "\n\n".join(part.strip() for part in parts if part and part.strip())
 
     async def _classify_text(
         self,
@@ -742,7 +964,9 @@ class TranslationPipeline:
         try:
             results = await asyncio.gather(
                 *(
-                    self.rag_svc.search(s, threshold=threshold, top_k=top_k, collection=collection)
+                    self.rag_svc.search(
+                        s, threshold=threshold, top_k=top_k, collection=collection
+                    )
                     for s in sources
                 ),
                 return_exceptions=True,
@@ -781,9 +1005,16 @@ class TranslationPipeline:
         enable_vision: bool = True,
         project_id: str | None = None,
         use_tm_exact_match: bool = False,
+        speakers: list[str | None] | None = None,
+        addressees: list[str | None] | None = None,
+        dialog_id: str | None = None,
+        scene_ids: list[str | None] | None = None,
+        relationship_stages: list[str | None] | None = None,
+        scene_tones: list[str | None] | None = None,
+        context_notes: list[str | None] | None = None,
     ) -> list[TranslationResult]:
         out: list[TranslationResult] = []
-        for src in sources:
+        for index, src in enumerate(sources):
             out.append(
                 await self.translate_single(
                     src,
@@ -797,6 +1028,15 @@ class TranslationPipeline:
                     enable_vision=enable_vision,
                     project_id=project_id,
                     use_tm_exact_match=use_tm_exact_match,
+                    speaker=speakers[index] if speakers else None,
+                    addressee=addressees[index] if addressees else None,
+                    dialog_id=dialog_id,
+                    scene_id=scene_ids[index] if scene_ids else None,
+                    relationship_stage=(
+                        relationship_stages[index] if relationship_stages else None
+                    ),
+                    scene_tone=scene_tones[index] if scene_tones else None,
+                    context_note=context_notes[index] if context_notes else None,
                 )
             )
         return out
@@ -848,7 +1088,11 @@ class TranslationPipeline:
         """
         if not self._web_search_active(enable_web_search):
             return [], False
-        thr = user_threshold if user_threshold is not None else self.default_web_search_dense_threshold
+        thr = (
+            user_threshold
+            if user_threshold is not None
+            else self.default_web_search_dense_threshold
+        )
         if not self._should_trigger_web_search(
             term_count=len(term_matches),
             dense_top1=diag.dense_top1,
@@ -957,6 +1201,16 @@ class TranslationPipeline:
         if not web_refs:
             return None
         return [r.model_dump() for r in web_refs]
+
+
+def _bounded_positive_int(value, *, default: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(parsed, maximum) if parsed > 0 else default
 
 
 __all__ = ["TranslationPipeline"]

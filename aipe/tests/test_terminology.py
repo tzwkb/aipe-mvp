@@ -36,6 +36,21 @@ def _make_xlsx(rows: list[tuple[str, str]]) -> bytes:
     return buf.getvalue()
 
 
+def _make_multisheet_xlsx() -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf) as writer:
+        pd.DataFrame({"说明": ["客户术语表"]}).to_excel(writer, sheet_name="说明", index=False)
+        pd.DataFrame(
+            [("占卜家", "序列9", "占卜家", "Seer"), ("占卜家", "序列0", "愚者", "Fool")],
+            columns=["途径", "序列", "中文", "英文"],
+        ).to_excel(writer, sheet_name="途径·序列", index=False)
+        pd.DataFrame(
+            [("愚者", "Fool"), ("黑夜女神", "Evernight Goddess")],
+            columns=["中文", "英文"],
+        ).to_excel(writer, sheet_name="神祇", index=False)
+    return buf.getvalue()
+
+
 def _write_project(root, name: str, rows: list[tuple[str, str]]) -> None:
     project_dir = root / name
     project_dir.mkdir(parents=True)
@@ -92,6 +107,15 @@ def test_parse_csv_with_english_headers():
     assert parsed == [
         {"source": "foo", "target": "bar"},
         {"source": "baz", "target": "qux"},
+    ]
+
+
+def test_parse_multisheet_xlsx_merges_named_term_sheets_in_order():
+    parsed = parse_terminology_bytes(_make_multisheet_xlsx(), "multi.xlsx")
+    assert parsed == [
+        {"source": "占卜家", "target": "Seer", "category": "途径·序列"},
+        {"source": "愚者", "target": "Fool", "category": "途径·序列"},
+        {"source": "黑夜女神", "target": "Evernight Goddess", "category": "神祇"},
     ]
 
 
